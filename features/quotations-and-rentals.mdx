@@ -1,0 +1,150 @@
+---
+title: "Quotation and Rental Lifecycle in SiCom"
+sidebarTitle: "Rentals"
+description: "Understand the full quotation-to-rental lifecycle, the nine-state machine, cart submission flow, employee assignment, and stored procedure stock control."
+---
+
+SiCom treats every client request as a single entity — a `Renta` — that begins as a quotation (`SOLICITADA`) and progresses through a defined set of operational states until it is either completed (`Finalizada`) or cancelled. The same lifecycle covers both the quoting phase (handled by admin staff reviewing incoming requests) and the physical delivery, pickup, and return phases (assigned to and executed by employees). This unified model means administrators, employees, and clients all interact with the same `Renta` record, distinguished only by its current `estado`.
+
+## The `Renta` Entity
+
+The `Renta` entity is persisted to the `renta` table and represents a rental agreement in any phase of its lifecycle.
+
+| Field | Column | Type | Notes |
+|---|---|---|---|
+| `id` | `idRenta` | `Integer` (PK, auto) | Generated identity |
+| `estado` | `estado` | `String` (max 45) | Current lifecycle state; required |
+| `idCliente` | `idCliente` | `Cliente` (ManyToOne) | Customer who placed the request |
+| `hora` | `hora` | `LocalTime` | Time the request was created |
+| `fechaInicio` | `fecha_inicio` | `LocalDate` | Delivery start date (event date) |
+| `fecha` | `fecha` | `LocalDate` | Return/collection date |
+| `idEmpleado` | `idEmpleado` | `Empleado` (OneToOne) | Employee currently assigned to the rental |
+| `entregado` | `Entregado` | `String` (max 45) | Name of the employee who performed delivery |
+| `recogido` | `Recogido` | `String` (max 45) | Name of the employee who performed collection |
+| `total` | `total` | `BigDecimal` (10,2) | Calculated total of all line items |
+| `detallesRenta` | — | `List<Detallerenta>` | Line items; ordered by ID ascending |
+
+### The `Detallerenta` Entity
+
+Each line item in a rental links a `Renta` to an `Articulo` with quantity and pricing captured at quote time.
+
+| Field | Column | Type | Notes |
+|---|---|---|---|
+| `id` | `iddetalle` | `Integer` (PK, auto) | Generated identity |
+| `idrenta` | `idrenta` | `Renta` (ManyToOne) | Parent rental |
+| `idarticulo` | `idarticulo` | `Articulo` (ManyToOne) | The rented article |
+| `cantidad` | `cantidad` | `Integer` | Number of units |
+| `precioUnitario` | `precio_unitario` | `BigDecimal` (10,2) | Unit price at time of quoting |
+| `precioTotal` | `precio_total` | `BigDecimal` (10,2) | `cantidad × precioUnitario` |
+
+## Client Shopping Flow
+
+A client request moves through three steps before creating a `Renta` record:
+
+1. **Date selection** — The client opens the catalog (`renta_cliente.xhtml`) and picks a `fechaInicio` (delivery) and `fechaSeleccionada` (return) via `ArticuloCatalogoBeanUI`. The catalog reloads with real-time availability calculated as `articulo.unidades − SUM(cantidad_reservada)` for every day in the chosen range.
+
+2. **Cart assembly** — The client clicks articles to add them to `CarritoBean` (`@Named("carritoBean")`, `@SessionScoped`). `agregarArticulo(ArticuloCardDTO)` looks up the full `Articulo` entity, checks stock for the date range, and adds it to the internal `Carrito`. Quantities are adjustable with `+`/`−` controls; the cart enforces the maximum available stock at all times.
+
+3. **Checkout** — The client fills in `nombreCliente`, `telefono1`, and `direccionEntrega` in the checkout dialog and accepts terms. `confirmarCotizacion()` calls `FacadeRenta.registrarRenta()` to persist the request with state `SOLICITADA`. A WhatsApp message with the quote summary is opened automatically in a new tab.
+
+## Rental State Machine
+
+A `Renta` progresses through up to nine states. `Cancelada` is reachable from any active state.
+
+```
+SOLICITADA
+    │
+    ▼ (admin approves)
+ Aprobada ─────────────────────────────────────────────────────┐
+    │                                                           │
+    ▼ (admin confirms)                                          │
+ Confirmado                                                     │
+    │                                                           │
+    ▼                                                           │
+ Pendiente a reparto                                            │
+    │                                                           │  Cancelada
+    ▼ (employee assigned + "En reparto")                        │  (from any
+ En reparto                                                     │   state)
+    │                                                           │
+    ▼ (delivery confirmed + comment)                            │
+ Entregado                                                      │
+    │                                                           │
+    ▼                                                           │
+ Pendiente a recoleccion                                        │
+    │                                                           │
+    ▼ (employee assigned + "En recoleccion")                    │
+ En recoleccion                                                 │
+    │                                                           │
+    ▼ (collection confirmed + comment)                          │
+ Finalizada ◄───────────────────────────────────────────────────┘
+```
+
+| State | Triggered by | Effect |
+|---|---|---|
+| `SOLICITADA` | Client submits cart | Initial state; stock not yet reserved |
+| `Aprobada` | Admin approves | Stored procedure reserves stock for the full date range |
+| `Confirmado` | Admin confirms | Additional warehouse SALIDA movement recorded |
+| `Pendiente a reparto` | Admin advances state | Awaiting employee assignment |
+| `En reparto` | Admin selects employee | `Renta.idEmpleado` set to selected employee |
+| `Entregado` | Employee or admin marks delivered | `entregado` field set to employee name; `idEmpleado` cleared; delivery comment saved |
+| `Pendiente a recoleccion` | Admin advances state | Awaiting pickup employee |
+| `En recoleccion` | Admin selects employee | `Renta.idEmpleado` set to collection employee |
+| `Finalizada` | Employee or admin marks complete | `recogido` field set to employee name; `idEmpleado` cleared; stock reservations released |
+| `Cancelada` | Admin cancels | Stock reservations released for the full date range |
+
+## The `cambiar_estado_renta` Stored Procedure
+
+State transitions that affect stock are handled atomically inside the MySQL stored procedure `cambiar_estado_renta(p_idRenta INT, p_nuevoEst VARCHAR)`.
+
+```sql
+-- Reserve stock when a SOLICITADA quote becomes Aprobada or Confirmado:
+-- For every day d in [fecha_inicio, fecha], for every Detallerenta:
+INSERT INTO stock_reservado_diario (idarticulo, fecha, cantidad_reservada)
+VALUES (v_idarticulo, v_dia_actual, v_cantidad)
+ON DUPLICATE KEY UPDATE cantidad_reservada = cantidad_reservada + v_cantidad;
+
+-- Release stock when state changes to Cancelada or Finalizada:
+UPDATE stock_reservado_diario
+SET cantidad_reservada = GREATEST(cantidad_reservada - v_cantidad, 0)
+WHERE idarticulo = v_idarticulo AND fecha = v_dia_actual;
+```
+
+The procedure is invoked by `DelegateRenta.cambiarEstado()`, which calls `RentaDAO.cambiarEstadoRenta()` and then runs `registrarMovimientosAutomaticos()` (SALIDA on `Confirmado`, ENTRADA on `Finalizada`) and `liberarReservasCliente()` (Java-side reservation cleanup on `Finalizada` and `Cancelada`).
+
+## FacadeRenta Methods
+
+```java
+// Register a new rental/quotation from the shopping cart
+public void registrarRenta(
+    Cliente cliente,
+    List<Detallerenta> detalles,
+    LocalDate fechaInicio,   // delivery start date
+    LocalDate fecha,         // return date
+    LocalTime hora,          // time of submission
+    String estado            // initial state, e.g. "SOLICITADA"
+) { ... }
+```
+
+| Method | Description |
+|---|---|
+| `obtenerCotizaciones()` | Returns all rentals in quotation phase (pre-Confirmado states) |
+| `obtenerRentas()` | Returns all active rental records |
+| `cambiarEstado(Integer, String)` | Calls the stored procedure and triggers warehouse movements |
+| `actualizarRentaConStock(Renta, LocalDate, LocalDate)` | Re-calculates stock reservations when dates or articles are changed on an existing rental |
+| `obtenerRentasDisponiblesYAsignadas(Integer)` | Returns rentals available for pickup or already assigned to a specific employee |
+| `guardarComentario(Comentario)` | Persists a delivery or collection note linked to a rental |
+| `obtenerComentarios(Integer)` | Returns all comments for a given rental ID |
+
+## Employee Assignment
+
+When an admin changes a rental state to `En reparto` or `En recoleccion`, `RentaBeanUI.onEstadoChange()` opens the employee assignment dialog and populates `listaEmpleados` from `EmpleadoHelper.getAllEmpleados()`. The admin selects one entry; `idEmpleadoSeleccionado` is resolved to an `Empleado` entity and written to `Renta.idEmpleado` via `asignarEmpleadoYActualizarEstado()`. The employee's name is later captured in `entregado` or `recogido` when the terminal state (`Entregado` / `Finalizada`) is reached.
+
+Employees have a filtered view: `EmpleadoRentaBeanUI` calls `obtenerRentasDisponiblesYAsignadas(idEmpleado)` so employees only see rentals that are unassigned or currently assigned to them.
+
+## Delivery and Collection Comments
+
+The `Comentario` entity stores free-text notes attached to a rental with a `tipo` field (`"Entrega"` or `"Recoleccion"`). Comments are entered via a dialog triggered when the state advances to `Entregado` or `Finalizada`. They are viewable from the rental detail screen by both admins and employees via `cargarComentariosRenta()`.
+
+<Note>
+`RentaBeanUI` sets `minDate = LocalDate.now()` at construction time, which is bound to all date-picker components in the rental edit dialogs. Administrators cannot reschedule a rental to a past date through the UI. The same minimum is enforced by `ArticuloCatalogoBeanUI.onFechaCambio()` on the client side, which validates that both `fechaInicio` and `fechaSeleccionada` are on or after today before loading stock.
+</Note>

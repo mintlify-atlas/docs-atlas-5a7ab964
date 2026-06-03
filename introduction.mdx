@@ -1,0 +1,109 @@
+---
+title: "SiCom: Java EE Rental Management for Event Businesses"
+sidebarTitle: "Introduction"
+description: "SiCom is a full-stack Jakarta EE 10 rental platform built for Eventos Campestre, covering catalogs, quotations, inventory, and analytics."
+---
+
+SiCom — Eventos Campestre is a full-stack rental management web application built for event service businesses that need to track articles, manage quotation and rental lifecycles, control daily stock, assign field employees, and monitor operations through analytics dashboards. The system handles everything from an administrator adding a new article to the catalog to a client submitting a quote request through the self-service portal, all the way to an employee marking items as delivered and collected.
+
+## What SiCom Covers
+
+- **Article catalog** — manage rentable items across six categories with images, pricing, and stock levels
+- **Quotation and rental lifecycle** — create quotes, convert them to rentals, track progress through each state, and record delivery and collection
+- **Daily stock reservation** — prevent over-booking by computing available units per day across overlapping rental date ranges
+- **Employee assignment** — assign staff members to specific rentals and let employees view and update their own workload
+- **Warehouse management** — record stock movements and maintain `StockDiario` and `StockReservadoDiario` records
+- **Analytics dashboards** — revenue summaries, quotation funnels, top-rented articles, client growth, and rental-status timelines
+
+## Tech Stack
+
+<CardGroup cols={2}>
+  <Card title="Jakarta EE 10" icon="layer-group">
+    Servlet 6, CDI 4 (Weld 5), JSF 4 (Mojarra), JPA 3 — all on Tomcat 10.1
+  </Card>
+  <Card title="PrimeFaces 14" icon="palette">
+    Component library with the `saga` theme, Font Awesome icons, and client-side validation
+  </Card>
+  <Card title="Hibernate 6 / JPA 3" icon="database">
+    ORM with HikariCP connection pooling (min 5, max 10 connections) and schema validation on startup
+  </Card>
+  <Card title="MySQL 8" icon="server">
+    Relational backend on port 3307 (default dev config); schema managed via SQL migration scripts
+  </Card>
+  <Card title="Angus Mail 2" icon="envelope">
+    Eclipse Angus implementation of Jakarta Mail for transactional email delivery
+  </Card>
+  <Card title="Apache POI 5" icon="file-excel">
+    Excel report generation using `poi-ooxml` for rental and inventory exports
+  </Card>
+</CardGroup>
+
+## Explore the Docs
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="quickstart">
+    Clone, configure, build, and deploy SiCom to a local Tomcat in minutes.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="architecture">
+    Understand the four-module Maven layout and how layers communicate.
+  </Card>
+  <Card title="Article Catalog" icon="boxes-stacked" href="features/catalog">
+    Manage rentable articles, categories, images, and stock levels.
+  </Card>
+  <Card title="Quotations & Rentals" icon="file-contract" href="features/quotations-and-rentals">
+    Follow the full quotation-to-rental state machine.
+  </Card>
+  <Card title="Inventory" icon="warehouse" href="features/inventory">
+    Daily stock reservation and warehouse movement tracking.
+  </Card>
+  <Card title="Dashboards" icon="chart-line" href="features/dashboard">
+    Operational and financial analytics for administrators.
+  </Card>
+</CardGroup>
+
+## Key Features
+
+### Six Article Categories
+
+SiCom organizes every rentable item into one of six `Categoria` enum values:
+
+| Category | Description |
+|---|---|
+| `MESA` | Tables — round (`REDONDA`) or rectangular (`RECTANGULAR`) shape |
+| `TEXTIL` | Linens — subdivided into `MANTEL`, `CAMINO`, and `CUBREMANTEL` types |
+| `SILLA` | Chairs for events of any size |
+| `CARPA` | Canopy tents and shade structures |
+| `COOLER` | Coolers and refrigeration equipment |
+| `CALENTON` | Patio heaters and warming equipment |
+
+Each article carries a name, unit price, stock count, an active/inactive flag, and a mandatory associated `Imagen` stored as binary data in the database.
+
+### Rental State Machine
+
+Every `Renta` record holds a string `estado` field that drives the UI workflow. The supported states progress from initial quote through active rental to completion or cancellation:
+
+- **COTIZACION** — initial quote submitted by the client
+- **ACEPTADA** — quote accepted, awaiting deposit or confirmation
+- **EN_PROCESO** — rental is active; items dispatched
+- **ENTREGADA** — items confirmed delivered by the assigned employee
+- **FINALIZADA** — items returned and rental closed
+- **CANCELADA** — rental cancelled at any stage
+
+State transitions are handled by `FacadeRenta.cambiarEstado()` and exposed to administrators through the `RentaBeanUI` managed bean.
+
+### Daily Stock Reservation
+
+When a client browses the catalog, SiCom computes real-time availability by querying `StockReservadoDiario` records. For a requested date range, the system finds the single most-saturated day (the bottleneck) and subtracts reserved units from total stock. This prevents over-booking even when multiple rentals overlap on a single calendar day.
+
+### Analytics Dashboards
+
+Administrators have access to four dedicated dashboard views powered by `FacadeDashboard` and `DashboardDAO`:
+
+- **Main dashboard** — key metrics (active rentals, pending quotes, revenue)
+- **Rentals dashboard** — daily rental status breakdown and timelines
+- **Quotations dashboard** — funnel analysis, conversion effectiveness, and total amounts
+- **Clients dashboard** — client growth over time and top-frequency customers
+
+<Note>
+SiCom requires **Java 21**, **Maven 3.9+**, and **MySQL 8+** to build and run. The `vista` module produces a standard WAR that deploys to **Apache Tomcat 10.1+** — no application server such as GlassFish or WildFly is needed.
+</Note>

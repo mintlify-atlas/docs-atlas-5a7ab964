@@ -1,0 +1,147 @@
+---
+title: "Build and Deploy SiCom to Apache Tomcat"
+sidebarTitle: "Build & Deploy"
+description: "Step-by-step guide to compiling all four Maven modules, producing vista.war, and deploying it to a Jakarta EE 10 compatible Tomcat 10.1 instance."
+---
+
+SiCom is a multi-module Maven project that compiles four modules in dependency order — `entidad` → `persistencia` → `negocio` → `vista` — and packages the result as a single WAR file (`vista.war`). The steps below take you from a fresh clone to a running instance on Apache Tomcat 10.1.
+
+<Steps>
+
+  <Step title="Clone the Repository">
+    ```bash
+    git clone https://github.com/dinogamer089/SiCom.git
+    cd SiCom
+    ```
+  </Step>
+
+  <Step title="Verify Java 21 Is Active">
+    The parent `pom.xml` sets `maven.compiler.source` and `maven.compiler.target` to `21`. Using an older JDK will cause a compilation error.
+
+    ```bash
+    java -version
+    ```
+
+    The output must report `21.x`. If you manage multiple JDK installations with a tool such as SDKMAN or jenv, activate the Java 21 distribution before proceeding.
+  </Step>
+
+  <Step title="Build All Modules from the Reactor Root">
+    Run the standard Maven lifecycle from the repository root. Maven resolves the `<modules>` declaration in the parent `pom.xml` and builds the modules in the correct dependency order.
+
+    ```bash
+    mvn clean install
+    ```
+
+    The build sequence is:
+
+    1. **entidad** — JPA entity classes; packaged as `entidad-1.0-SNAPSHOT.jar`
+    2. **persistencia** — DAOs, `persistence.xml`, HikariCP/Hibernate configuration; packaged as `persistencia-1.0-SNAPSHOT.jar`
+    3. **negocio** — Business-logic façade beans; packaged as `negocio-1.0-SNAPSHOT.jar`
+    4. **vista** — JSF/PrimeFaces web layer; packages everything into `vista.war`
+
+    A successful build ends with `BUILD SUCCESS` and all four modules reporting `[INFO] BUILD SUCCESS`.
+  </Step>
+
+  <Step title="Locate the Deployable WAR">
+    After the build completes, the deployable archive is at:
+
+    ```bash
+    vista/target/vista.war
+    ```
+
+    The final name is fixed to `vista` by `<finalName>vista</finalName>` in `vista/pom.xml`, so the context path in the browser will always be `/vista`.
+  </Step>
+
+  <Step title="Deploy to Tomcat">
+    Copy the WAR to Tomcat's `webapps` directory and start the server:
+
+    ```bash
+    cp vista/target/vista.war $CATALINA_HOME/webapps/
+
+    # Linux / macOS
+    $CATALINA_HOME/bin/startup.sh
+
+    # Windows
+    %CATALINA_HOME%\bin\startup.bat
+    ```
+
+    Tomcat will explode the WAR automatically on startup. Watch `$CATALINA_HOME/logs/catalina.out` for any `PersistenceException` messages, which would indicate that the database is not reachable or that the schema validation failed.
+  </Step>
+
+  <Step title="Open the Application in a Browser">
+    ```
+    http://localhost:8080/vista/
+    ```
+
+    The welcome file configured in `web.xml` is `AutenticacionUsuario.xhtml`, so Tomcat immediately forwards the root request to the login page:
+
+    ```
+    http://localhost:8080/vista/AutenticacionUsuario.xhtml
+    ```
+
+    A visible login form confirms the JSF servlet, Weld CDI listener, and JPA persistence unit all initialised successfully.
+  </Step>
+
+</Steps>
+
+## PrimeFaces Theme
+
+The default theme is **saga**, set via a `<context-param>` in `web.xml`:
+
+```xml
+<context-param>
+    <param-name>primefaces.THEME</param-name>
+    <param-value>saga</param-value>
+</context-param>
+```
+
+Any PrimeFaces-bundled theme name (e.g., `lara-light-blue`, `arya-blue`, `vela-green`) can be substituted without recompiling the project — edit the `<param-value>` and redeploy.
+
+## File Upload Configuration
+
+Two mechanisms work together to support catalogue image uploads:
+
+**`UploadInitListener`** (`config.UploadInitListener`) is registered as a `ServletContextListener` in `web.xml` and fires during application startup. It relaxes Tomcat's internal file-count and parameter-count limits by setting system properties:
+
+```java
+System.setProperty("org.apache.tomcat.util.http.fileupload.FileUploadBase.fileCountMax", "-1");
+System.setProperty("org.apache.tomcat.util.http.Parameters.MAX_COUNT", "20000");
+```
+
+**`UploadImageServlet`** handles `POST` requests to `/upload-image`. It reads the `imagen` multipart part, stores the raw bytes and MIME type in the HTTP session, and returns `204 No Content` to the caller:
+
+```java
+@WebServlet(name = "UploadImageServlet", urlPatterns = "/upload-image")
+@MultipartConfig(maxFileSize = 10 * 1024 * 1024, maxRequestSize = 20 * 1024 * 1024)
+public class UploadImageServlet extends HttpServlet { ... }
+```
+
+The PrimeFaces uploader is configured to use the native servlet multipart mechanism:
+
+```xml
+<context-param>
+    <param-name>primefaces.UPLOADER</param-name>
+    <param-value>native</param-value>
+</context-param>
+```
+
+This means PrimeFaces delegates multipart parsing to Tomcat's built-in handler (backed by the `<multipart-config>` in `web.xml`) rather than the Apache Commons FileUpload library.
+
+## Logging
+
+SiCom uses **SLF4J 2.0.9** as the logging façade and **Logback 1.4.11** as the implementation, both declared in `vista/pom.xml`. Place a `logback.xml` configuration file in `vista/src/main/resources/` to control log levels and appenders. Without an explicit configuration, Logback falls back to its default `DEBUG` console appender.
+
+<Note>
+  **JSF development mode:** `web.xml` sets `jakarta.faces.PROJECT_STAGE` to `Development`. In this mode JSF renders additional debug information in the browser (component tree inspection, EL expression errors, etc.) and disables some resource caching. Switch the value to `Production` before any live deployment to enable resource bundling, suppress debug output, and improve page-load performance:
+
+  ```xml
+  <context-param>
+      <param-name>jakarta.faces.PROJECT_STAGE</param-name>
+      <param-value>Production</param-value>
+  </context-param>
+  ```
+</Note>
+
+<Warning>
+  **Client-side validation is enabled:** `primefaces.CLIENT_SIDE_VALIDATION=true` is set in `web.xml`. PrimeFaces mirrors server-side bean validation constraints (`@NotNull`, `@Size`, etc.) to JavaScript, providing immediate feedback without a round-trip. This is standard PrimeFaces behaviour and works correctly as long as the Jakarta Bean Validation constraints on your entity/backing-bean fields are kept consistent with the database schema. Do not disable this setting without also reviewing all form pages for missing server-side validation fallbacks.
+</Warning>

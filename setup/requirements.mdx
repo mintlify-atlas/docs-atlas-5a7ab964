@@ -1,0 +1,69 @@
+---
+title: "System Requirements for Running SiCom"
+sidebarTitle: "Requirements"
+description: "Exact Java, Maven, MySQL, and Tomcat versions required to run SiCom, including key dependency versions, connection pool settings, and upload limits."
+---
+
+SiCom — Eventos Campestre targets a well-defined runtime stack. Before installing or building the application, confirm that every component below is available in your environment. Mixing incompatible versions — particularly an older servlet container that lacks Jakarta EE 10 namespace support — is the most common source of startup failures.
+
+## Runtime Requirements
+
+| Component | Minimum Version | Notes |
+|-----------|----------------|-------|
+| **Java (JDK)** | 21 | `maven.compiler.source` and `maven.compiler.target` are both set to `21` in the parent `pom.xml` |
+| **Apache Maven** | 3.9+ | Required to build the four-module reactor; earlier versions may not honour the `<modules>` ordering correctly |
+| **MySQL** | 8.0+ | JDBC driver class `com.mysql.cj.jdbc.Driver` (connector `mysql-connector-j 9.2.0`) |
+| **Apache Tomcat** | 10.1+ | Jakarta EE 10 servlet namespace (`web-app_6_0.xsd`, `version="6.0"`); Tomcat 9 uses the `javax.*` namespace and is **not** compatible |
+
+## Key Dependency Versions
+
+The `vista` module declares all runtime dependencies. The versions below are fixed in `vista/pom.xml` property entries.
+
+| Dependency | Version | Classifier / Notes |
+|------------|---------|-------------------|
+| `org.primefaces:primefaces` | **14.0.0** | `jakarta` classifier — required for Jakarta EE 10 namespace |
+| `org.primefaces.extensions:primefaces-extensions` | **14.0.0** | `jakarta` classifier |
+| `org.glassfish:jakarta.faces` | **4.0.1** | Mojarra (JSF 4) implementation, bundled in the WAR |
+| `org.jboss.weld.servlet:weld-servlet-shaded` | **5.1.1.Final** | CDI 4 provider — see note below |
+| `org.eclipse.angus:angus-mail` | **2.0.2** | Jakarta Mail implementation (replaces `javax.mail`) |
+| `org.apache.poi:poi-ooxml` | **5.2.4** | Excel report generation |
+| `com.jfree:jfreechart` | **1.5.3** | Optional — dashboard charts |
+| `com.itextpdf:itext-core` | **8.0.2** | Optional — PDF report export |
+| `org.slf4j:slf4j-api` | **2.0.9** | Logging façade |
+| `ch.qos.logback:logback-classic` | **1.4.11** | Logging implementation |
+
+### Optional Integrations
+
+| Integration | Version | Purpose |
+|-------------|---------|---------|
+| Google Drive API v3 | `v3-rev20230822-2.0.0` | Remote image storage for article photos |
+| Google API Client | `2.2.0` | OAuth 2.0 transport for Drive |
+| Google OAuth Client | `1.34.1` | Token management |
+
+<Note>
+  **CDI on Tomcat via Weld:** Tomcat does not include a CDI container. SiCom bundles `weld-servlet-shaded` directly in the WAR, which registers itself through `org.jboss.weld.environment.servlet.Listener` (declared in `web.xml`). No separate CDI runtime installation is needed — the shaded JAR is self-contained and activates automatically on application startup.
+</Note>
+
+## Connection Pool Sizing
+
+The `persistencia` module uses HikariCP as the JDBC connection pool, configured inside `persistence.xml`. The defaults are sized for a single-node development or small-production environment:
+
+| HikariCP Property | Value | Meaning |
+|-------------------|-------|---------|
+| `hibernate.hikari.minimumIdle` | `5` | Minimum idle connections kept warm |
+| `hibernate.hikari.maximumPoolSize` | `10` | Hard ceiling on total connections |
+| `hibernate.hikari.idleTimeout` | `30000` | Milliseconds before an idle connection is retired (30 s) |
+
+Adjust these values in `persistencia/src/main/resources/META-INF/persistence.xml` before deploying to a server that handles concurrent bookings.
+
+## File Upload Limits
+
+The Faces Servlet's `<multipart-config>` block in `web.xml` enforces the following limits for catalogue image uploads:
+
+| Setting | Value |
+|---------|-------|
+| `max-file-size` | **10 MB** (10 485 760 bytes) |
+| `max-request-size` | **20 MB** (20 971 520 bytes) |
+| `file-size-threshold` | `0` (write directly to disk, no memory buffer) |
+
+The same limits are mirrored on `UploadImageServlet` via `@MultipartConfig(maxFileSize = 10 * 1024 * 1024, maxRequestSize = 20 * 1024 * 1024)`, which handles the `/upload-image` endpoint used by the image management views.

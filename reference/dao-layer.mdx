@@ -1,0 +1,401 @@
+---
+title: "Persistence Layer DAO Reference for SiCom"
+sidebarTitle: "DAO Layer"
+description: "Reference for the AbstractDAO base class, HibernateUtil singleton, ServiceLocator factory, and all concrete DAOs in the persistencia module of SiCom."
+---
+
+The `persistencia` module (Maven artifact `persistencia`) is the sole gateway to the MySQL 8 database. All persistence classes live under the root package `mx.avanti.desarollo`. The module is built around three pillars: `HibernateUtil` bootstraps a single `EntityManagerFactory`; `ServiceLocator` hands out fresh DAO instances on demand; and `AbstractDAO<T>` provides a generic, transaction-aware CRUD base that every concrete DAO extends. Custom queries beyond standard CRUD are added directly to each concrete DAO class.
+
+<Warning>
+The persistence unit is configured with `hbm2ddl.auto=validate`. Hibernate will **not** create or migrate database tables on startup — it only validates that the schema matches the entity mappings. All tables, columns, indexes, and the stored procedure `cambiar_estado_renta` must exist in the target MySQL database before the application is deployed. Use the provided SQL scripts to set up the schema.
+</Warning>
+
+<Note>
+`hibernate.show_sql=true` and `hibernate.format_sql=true` are enabled in `persistence.xml`. In a production environment these settings should be set to `false` or removed entirely. Logging every SQL statement to standard output can significantly degrade throughput under load and exposes query details in application server logs.
+</Note>
+
+---
+
+## HibernateUtil
+
+**Package:** `mx.avanti.desarollo.persistence`  
+**Source:** `persistencia/src/main/java/mx/avanti/desarollo/persistence/HibernateUtil.java`
+
+`HibernateUtil` holds the application-wide `EntityManagerFactory` in a `static final` field initialised during class-loading. Because class initialisation in the JVM is thread-safe, no additional synchronisation is required.
+
+```java
+// Initialisation happens once when the class is first loaded
+private static final EntityManagerFactory ENTITY_MANAGER_FACTORY =
+    buildEntityManagerFactory();
+
+private static EntityManagerFactory buildEntityManagerFactory() {
+    try {
+        return Persistence.createEntityManagerFactory("persistencePU");
+    } catch (Throwable ex) {
+        System.err.println("Error creando EntityManagerFactory: " + ex);
+        ex.printStackTrace();
+        throw new ExceptionInInitializerError(ex);
+    }
+}
+```
+
+The factory is built from the persistence unit named **`persistencePU`** declared in `persistence.xml`. Any failure during factory construction is wrapped in `ExceptionInInitializerError`, which will prevent the application from starting.
+
+### Static methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `getEntityManagerFactory` | `static EntityManagerFactory getEntityManagerFactory()` | Returns the shared `EntityManagerFactory`. |
+| `getEntityManager` | `static EntityManager getEntityManager()` | Creates and returns a **new** `EntityManager` from the factory. Every caller is responsible for closing it. |
+| `close` | `static void close()` | Closes the factory if it is open. Intended for application shutdown hooks. |
+
+Each `AbstractDAO.execute(...)` call opens a fresh `EntityManager` via `HibernateUtil.getEntityManager()`, runs the operation inside a transaction, and closes the manager in a `finally` block — so `EntityManager` instances are never shared across threads or requests.
+
+---
+
+## ServiceLocator
+
+**Package:** `mx.avanti.desarollo.integration`  
+**Source:** `persistencia/src/main/java/mx/avanti/desarollo/integration/ServiceLocator.java`
+
+`ServiceLocator` is a static factory that creates a fresh DAO instance for each call. Every accessor opens a new `EntityManager` via `HibernateUtil.getEntityManager()` and passes it to the DAO constructor, ensuring that every DAO operates with its own isolated `EntityManager`.
+
+```java
+public static ArticuloDAO getInstanceArticuloDAO() {
+    return new ArticuloDAO(getEntityManager());
+}
+```
+
+Registered accessor methods:
+
+| Accessor | Returns |
+|---|---|
+| `getInstanceAdministradorDAO()` | `AdministradorDAO` |
+| `getInstanceEmpleadoDAO()` | `EmpleadoDAO` |
+| `getInstanceArticuloDAO()` | `ArticuloDAO` |
+| `getInstanceRentaDAO()` | `RentaDAO` |
+| `getInstanceCombinacionMesaDAO()` | `CombinacionMesaDAO` |
+| `getInstanceStockReservadoDAO()` | `StockReservadoDAO` |
+| `getInstanceStockDiarioDAO()` | `StockDiarioDAO` |
+| `getInstanceMovimientoAlmacenDAO()` | `MovimientoAlmacenDAO` |
+| `getInstanceComentarioDAO()` | `ComentarioDAO` |
+
+`DashboardDAO` and `DetallerentaDAO` are **not** registered in `ServiceLocator`; they are instantiated directly where needed.
+
+---
+
+## AbstractDAO\<T\>
+
+**Package:** `mx.avanti.desarollo.persistence`  
+**Source:** `persistencia/src/main/java/mx/avanti/desarollo/persistence/AbstractDAO.java`
+
+Generic base class for all concrete DAOs. The type parameter `T` is the JPA entity class managed by the subclass.
+
+```java
+public abstract class AbstractDAO<T> {
+    private final Class<T> entityClass;
+
+    protected AbstractDAO(Class<T> entityClass) {
+        this.entityClass = entityClass;
+    }
+
+    protected abstract EntityManager getEntityManager();
+    // ... CRUD and query helpers
+}
+```
+
+Every public operation is executed inside `protected <R> R execute(Function<EntityManager, R> function)`, which:
+
+1. Obtains a fresh `EntityManager` from `HibernateUtil.getEntityManager()`.
+2. Begins a transaction.
+3. Applies the lambda.
+4. Commits on success or rolls back on `RuntimeException`.
+5. Closes the `EntityManager` in a `finally` block.
+
+### CRUD methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `save` | `void save(T entity)` | Persists a new entity via `em.persist(entity)` inside a transaction. |
+| `update` | `void update(T entity)` | Merges changes to an existing entity via `em.merge(entity)`. |
+| `delete` | `void delete(T entity)` | Removes an entity. If the entity is detached it is re-merged before removal. |
+| `find` | `Optional<T> find(Object id)` | Looks up an entity by primary key using `em.find(entityClass, id)`. Returns `Optional.empty()` if not found. |
+| `findFresh` | `Optional<T> findFresh(Object id)` | Like `find`, but calls `em.refresh(entity)` after loading to ensure the state is not stale. |
+| `findAll` | `List<T> findAll()` | Executes `SELECT e FROM EntitySimpleName e` and returns all rows. |
+| `saveOrUpdate` | `T saveOrUpdate(T entity)` | Merges the entity and flushes, returning the managed merged instance. |
+
+### Query-helper methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `executeCountQuery` | `int executeCountQuery(String query)` | Executes a JPQL `COUNT` query and returns the result as `int`. |
+| `findFromWhere` | `List<T> findFromWhere(String de, String campo, String criterio)` | Builds `SELECT DISTINCT a FROM T a JOIN a.<de> b WHERE b.<campo> = :value` dynamically. |
+| `findByOneParameterUnique` | `T findByOneParameterUnique(String value, String field)` | Returns a single entity where `<field> = :value`; returns `null` on `NoResultException`. |
+| `findByField` | `List<T> findByField(String fieldName, Object value)` | Alias for `findByOneParameter(value, fieldName)`. |
+| `findByOneParameter` | `List<T> findByOneParameter(Object value, String field)` | Returns all entities matching `<field> = :value`. |
+| `executeProcedure` | `List<T> executeProcedure(String procedureName)` | Executes a no-parameter stored procedure and maps the result list to `T`. |
+| `executeNativeQuery` | `List<T> executeNativeQuery(String sql)` | Executes a raw SQL query and maps results to `T` via the JPA entity mapping. |
+
+---
+
+## Concrete DAOs
+
+### ArticuloDAO
+
+**Entity:** `mx.desarollo.entity.Articulo`  
+**Extends:** `AbstractDAO<Articulo>`
+
+Manages rental article persistence, including atomic article-plus-image save operations and catalogue-specific queries.
+
+**Notable custom methods:**
+
+| Method | Description |
+|---|---|
+| `listarActivosConStock()` | `SELECT a FROM Articulo a LEFT JOIN FETCH a.imagen WHERE a.activo = true AND a.unidades > 0 ORDER BY a.categoria, a.nombre`. Fetches only active articles with stock available, with image eagerly loaded. Used exclusively for the client catalogue. |
+| `obtenerTodos()` | `SELECT DISTINCT a FROM Articulo a LEFT JOIN FETCH a.imagen ORDER BY a.id`. Returns all articles with images, for admin screens. |
+| `findWithImage(Integer id)` | `SELECT a FROM Articulo a LEFT JOIN FETCH a.imagen WHERE a.id = :id`. Eager-loads the image for a single article to prevent `LazyInitializationException` in JSF. |
+| `saveWithImage(Articulo, Imagen)` | Persists the `Imagen` first, flushes to obtain its generated ID, links it to the `Articulo`, then persists the article — all in one transaction. |
+| `updateWithImage(Articulo)` | If the article has a new (unsaved) `Imagen`, persists it first; then merges the article. |
+| `deleteById(Integer id)` | Finds the article and removes it within a transaction; no-op if not found. |
+| `existsByNombre(String nombre)` | Checks for name duplicates using `LOWER(TRIM(a.nombre)) = LOWER(TRIM(:nombre))`. |
+| `existsByNombreExcludingId(String nombre, Integer excludeId)` | Same normalisation as above but excludes a specific ID, used when editing an existing article. |
+
+```java
+// JPQL for client catalogue
+"SELECT a FROM Articulo a " +
+"LEFT JOIN FETCH a.imagen " +
+"WHERE a.activo = true AND a.unidades > 0 " +
+"ORDER BY a.categoria, a.nombre"
+```
+
+---
+
+### RentaDAO
+
+**Entity:** `mx.desarollo.entity.Renta`  
+**Extends:** `AbstractDAO<Renta>`
+
+The most complex DAO in the system. Handles quotation and rental retrieval, state transitions via stored procedure, full transactional registration, and stock-reservation reconciliation.
+
+**Notable custom methods:**
+
+| Method | Description |
+|---|---|
+| `obtenerTodosCotizaciones()` | Fetches rentals in state `SOLICITADA` with detail lines and articles eagerly loaded. |
+| `obtenerTodosRentas()` | Fetches all rentals **except** `SOLICITADA`, with detail lines and articles. |
+| `obtenerRentaID(Integer idRenta)` | Full eager fetch of a single rental including `idCliente`, `detallesRenta`, and articles. |
+| `cambiarEstadoRenta(Integer idRenta, String nuevoEstado)` | Executes the stored procedure `cambiar_estado_renta` via native SQL. Manages its own transaction. |
+| `obtenerRentasDisponiblesYAsignadas(Integer idEmpleadoLogueado)` | Multi-criteria JPQL query combining unassigned pending-dispatch rentals, all pending-collection rentals, and the employee's own active tasks. |
+| `registrarRenta(Cliente, List<Detallerenta>, LocalDate, LocalDate, LocalTime, String)` | Transactionally registers a new rental from cart checkout — persists client if new, creates `Renta` header, calculates total, then persists all detail lines. |
+| `actualizarRentaConStock(Renta, LocalDate, LocalDate)` | Reconciles a rental edit: removes deleted details, releases their reservations, validates new availability, and adjusts `StockReservadoDiario` for the new date range. |
+| `existeAsignacionPendiente(Integer empleadoId)` | Returns `true` if the employee has any rental in `En reparto` or `En recoleccion`. |
+
+```sql
+-- Stored procedure call used by cambiarEstadoRenta
+CALL cambiar_estado_renta(:idRent, :nuevoEst)
+```
+
+```java
+// JPQL for employee task list
+"SELECT r FROM Renta r " +
+"LEFT JOIN FETCH r.detallesRenta dr " +
+"LEFT JOIN FETCH dr.idarticulo " +
+"LEFT JOIN FETCH r.idCliente " +
+"LEFT JOIN FETCH r.idEmpleado " +
+"WHERE " +
+"(r.estado = 'Pendiente a reparto' AND r.idEmpleado IS NULL) " +
+"OR (r.estado = 'Pendiente a recoleccion') " +
+"OR (r.idEmpleado.id = :empId AND r.estado IN ('En reparto', 'En recoleccion')) " +
+"ORDER BY r.fechaInicio ASC, r.hora ASC"
+```
+
+---
+
+### EmpleadoDAO
+
+**Entity:** `mx.desarollo.entity.Empleado`  
+**Extends:** `AbstractDAO<Empleado>`
+
+Standard employee persistence. Inherits all CRUD operations from `AbstractDAO`.
+
+**Notable custom methods:**
+
+| Method | Description |
+|---|---|
+| `findByCorreo(String correo)` | `SELECT e FROM Empleado e WHERE e.correo = :correo`. Returns `null` on `NoResultException`. Used by `DelegateLogin` for authentication. |
+| `findById(Integer id)` | Typed JPQL lookup by primary key; returns `null` if not found (as opposed to the inherited `find(id)` which returns `Optional`). |
+
+---
+
+### ClienteDAO
+
+**Entity:** `mx.desarollo.entity.Cliente`  
+**Extends:** `AbstractDAO<Cliente>`
+
+Thin DAO that relies entirely on the `AbstractDAO` CRUD methods. Clients are created during rental registration (`RentaDAO.registrarRenta`) rather than through a dedicated management screen.
+
+No custom methods beyond the `AbstractDAO` base.
+
+---
+
+### AdministradorDAO
+
+**Entity:** `mx.desarollo.entity.Administrador`  
+**Extends:** `AbstractDAO<Administrador>`
+
+Manages administrator accounts. Authentication queries are centralised here.
+
+**Notable custom methods:**
+
+| Method | Description |
+|---|---|
+| `findByCorreo(String correo)` | `SELECT a FROM Administrador a WHERE a.correo = :correo`. Returns `null` on `NoResultException`. The primary authentication query; result is verified with BCrypt in `DelegateLogin`. |
+
+---
+
+### ComentarioDAO
+
+**Entity:** `mx.desarollo.entity.Comentario`  
+**Extends:** `AbstractDAO<Comentario>`
+
+Manages rental comments. Provides direct `EntityManager` transaction management for saves (bypassing `AbstractDAO.execute` for insert) to isolate comment persistence failures from other operations.
+
+**Notable custom methods:**
+
+| Method | Description |
+|---|---|
+| `obtenerComentarios(Integer idRenta)` | `SELECT c FROM Comentario c WHERE c.idRenta.id = :idRenta`. Returns an empty list if `idRenta` is `null` or on any exception. |
+| `guardarComentario(Comentario comentario)` | Persists a comment in a self-managed transaction; rolls back and prints the stack trace on failure without re-throwing. |
+
+---
+
+### DashboardDAO
+
+**Package:** `mx.avanti.desarollo.dao`  
+**Does not extend AbstractDAO** — manages its own `EntityManager` per method to keep each query independent.
+
+Provides all analytical queries for the dashboard. Each method opens a fresh `EntityManager`, executes its query, and closes the manager in a `finally` block.
+
+**Methods and their JPQL/query logic:**
+
+| Method | Description |
+|---|---|
+| `countRentasExitosas(Date start, Date end)` | Counts rentals whose `fecha` falls in the range, excluding cancelled and quotation states (defined by `EstadosConfig`). |
+| `countRentasCanceladas(Date start, Date end)` | Counts rentals in `EstadosConfig.CANCELADA` states within the date range. |
+| `countCotizaciones(Date start, Date end)` | Full count of all rentals regardless of state or date (total-ever metric). |
+| `sumTotalRentasExitosas(Date start, Date end)` | `COALESCE(SUM(r.total), 0)` excluding cancelled and quotation states. |
+| `avgGananciaPorRenta(Date start, Date end)` | `COALESCE(AVG(r.total), 0)` excluding cancelled and quotation states. |
+| `findTopArticulosVendidos(Date start, Date end, int topN)` | Groups by `a.id, a.nombre` across `Detallerenta` join, ordered by `SUM(d.cantidad) DESC`, limited to `topN`. Returns `List<TopArticuloDTO>`. |
+| `sumCantidadTotalArticulosVendidos(Date start, Date end)` | `COALESCE(SUM(d.cantidad), 0)` across all non-cancelled, non-quoted rentals in range. Used to calculate article percentage share. |
+| `findDailyStatus(Date start, Date end)` | Groups by `r.fecha` to produce `DailyRentaStatusDTO` with total, completed, and cancelled counts per day. |
+| `findCotizacionFunnel(Date start, Date end)` | Single aggregation: total created, total that progressed past `SOLICITADA`, and total `Finalizada`. Returns `CotizacionFunnelDTO`. |
+| `findCotizacionesPorTamano(Date start, Date end)` | Buckets rentals into SMALL (`< $5,000`), MEDIUM (`$5,000–$20,000`), VIP (`> $20,000`) and counts quotations vs. confirmed rentals per bucket. Returns `List<CotizacionEfectividadDTO>`. |
+| `sumMontosCotizaciones(Date start, Date end)` | Total quoted amount vs. total closed (successful) amount in range. Returns `CotizacionMontosDTO`. |
+| `countClientesTotales(Date start, Date end)` | `COUNT(DISTINCT LOWER(c.nombre))` — distinct clients by normalised name, full table (ignores date range). |
+| `countClientesNuevos(Date start, Date end)` | Clients whose `MIN(r.fecha)` falls within the range (first-time renters in period). |
+| `countClientesFrecuentes(Date start, Date end)` | Clients with `COUNT(r) > 1` within the range, excluding cancelled and quotation states. |
+| `findGrowthClientesMensual(LocalDate inicio, LocalDate fin)` | Builds a day-by-day cumulative growth series using in-memory aggregation of first-registration dates. Returns `List<ClienteGrowthPoint>`. |
+| `findClientesFrecuentes(int topN)` | Top-N clients by all-time rental count, using `GROUP BY r.idCliente.nombre ORDER BY COUNT(r) DESC`. Returns `List<ClienteFrecuenciaDTO>`. |
+
+```java
+// Example: top articles JPQL
+"SELECT new mx.avanti.desarollo.dashboard.TopArticuloDTO(a.id, a.nombre, SUM(d.cantidad)) " +
+"FROM Detallerenta d " +
+"JOIN d.idrenta r " +
+"JOIN d.idarticulo a " +
+"WHERE (r.fecha BETWEEN :start AND :end OR r.fecha IS NULL) " +
+"AND r.estado NOT IN :noEstados " +
+"GROUP BY a.id, a.nombre " +
+"ORDER BY SUM(d.cantidad) DESC"
+```
+
+---
+
+### MovimientoAlmacenDAO
+
+**Entity:** `mx.desarollo.entity.MovimientoAlmacen`  
+**Extends:** `AbstractDAO<MovimientoAlmacen>`
+
+Manages warehouse movement records (ENTRADA / SALIDA). Movements are created automatically by `DelegateRenta` when a rental transitions to `Confirmado` or `Finalizada`, and can also be created manually via `FacadeTarjetaAlmacen`.
+
+**Notable custom methods:**
+
+| Method | Description |
+|---|---|
+| `obtenerPorArticuloYFecha(Integer idArticulo, LocalDate fecha)` | Returns all movements for one article on one date, ordered by `fechaHoraRegistro ASC`. |
+| `obtenerPorArticuloYRango(Integer idArticulo, LocalDate fechaInicio, LocalDate fechaFin)` | Returns movements across a date range, ordered by date then registration time. |
+| `calcularTotalEntradas(Integer idArticulo, LocalDate fecha)` | `COALESCE(SUM(m.cantidad), 0)` where `tipoMovimiento = ENTRADA`. |
+| `calcularTotalSalidas(Integer idArticulo, LocalDate fecha)` | `COALESCE(SUM(m.cantidad), 0)` where `tipoMovimiento = SALIDA`. |
+| `obtenerPorRenta(Integer idRenta)` | Returns all movements linked to a specific rental, ordered by `fechaHoraRegistro ASC`. |
+
+---
+
+### StockDiarioDAO
+
+**Entity:** `mx.desarollo.entity.StockDiario`  
+**Extends:** `AbstractDAO<StockDiario>`
+
+Tracks opening inventory and closing inventory per article per day. Uses a two-argument constructor (`StockDiarioDAO(EntityManager, boolean useField)`) to store the `EntityManager` in a field, unlike the base class pattern.
+
+**Notable custom methods:**
+
+| Method | Description |
+|---|---|
+| `obtenerPorArticuloYFecha(Integer idArticulo, LocalDate fecha)` | Returns `Optional<StockDiario>` for the exact date. |
+| `obtenerInventarioInicial(Integer idArticulo, LocalDate fecha)` | Three-tier fallback: (1) exact-date record, (2) most recent prior record's `existenciaFinal`, (3) the article's current `unidades` field from the catalogue. Returns `0` if all tiers fail. |
+
+---
+
+### StockReservadoDAO
+
+**Entity:** `mx.desarollo.entity.StockReservadoDiario`  
+**Does not extend AbstractDAO** — manages its own `EntityManager` injected via constructor.
+
+Auxiliary table (`stock_reservado_diario`) that tracks how many units of each article are reserved on each calendar day. This is the source of truth for availability checks in the cart and rental editing flow.
+
+**Notable custom methods:**
+
+| Method | Description |
+|---|---|
+| `obtenerReservado(int idArticulo, LocalDate fecha)` | Native SQL query returning `cantidad_reservada` for the given article and date; returns `0` if no record exists. |
+| `ajustarStockReservado(Integer idArticulo, LocalDate fecha, Integer cantidadAjuste)` | Transactionally increments or decrements the reserved count. Creates a new record if the adjustment is positive and no record exists; deletes the record if the resulting count drops to zero or below. |
+| `obtenerMaximoReservadoEnRango(int idArticulo, LocalDate fechaInicio, LocalDate fechaFin)` | Native SQL `COALESCE(MAX(cantidad_reservada), 0)` across the date range. Used by the cart to find the bottleneck day and report the true worst-case availability for multi-day rentals. |
+
+```sql
+-- Native queries used by StockReservadoDAO
+SELECT cantidad_reservada
+FROM stock_reservado_diario
+WHERE idarticulo = ?1 AND fecha = ?2
+
+SELECT COALESCE(MAX(cantidad_reservada), 0)
+FROM stock_reservado_diario
+WHERE idarticulo = ?1 AND fecha BETWEEN ?2 AND ?3
+```
+
+---
+
+### DetallerentaDAO
+
+**Entity:** `mx.desarollo.entity.Detallerenta`  
+**Extends:** `AbstractDAO<Detallerenta>`
+
+Thin DAO for rental line items. Relies entirely on the `AbstractDAO` CRUD methods. Rental details are persisted inline inside `RentaDAO.registrarRenta` and `RentaDAO.actualizarRentaConStock`; this DAO is available for standalone operations if needed.
+
+No custom methods beyond the `AbstractDAO` base.
+
+---
+
+## Persistence unit summary
+
+The persistence unit `persistencePU` defined in `persistence.xml` configures:
+
+| Property | Value |
+|---|---|
+| Persistence unit name | `persistencePU` |
+| Provider | Hibernate 6 (Jakarta Persistence) |
+| `hbm2ddl.auto` | `validate` |
+| `hibernate.show_sql` | `true` |
+| `hibernate.format_sql` | `true` |
+| Database | MySQL 8 via the application-server data source |
+
+The stored procedure `cambiar_estado_renta(IN idRent INT, IN nuevoEst VARCHAR)` must be present in the database schema. It is called directly from `RentaDAO.cambiarEstadoRenta` via a native query.

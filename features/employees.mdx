@@ -1,0 +1,132 @@
+---
+title: "Employee Management and Delivery Assignment in SiCom"
+sidebarTitle: "Employees"
+description: "Learn how to create and manage employee accounts, assign staff to deliveries and collections, and understand the employee-side rental workflow."
+---
+
+SiCom distinguishes two internal roles: **Administrador** users who have full access to the back-office, and **Empleado** users who see only the rentals they can act on. The employee module covers account creation, login routing, and the delivery-focused rental view that employees use in the field.
+
+## The `Empleado` Entity
+
+Employees are persisted to the `empleado` table. The entity is intentionally simple — its fields cover identity, login credentials, and a computed full-name helper:
+
+| Field | Column | Type | Notes |
+|---|---|---|---|
+| `id` | `idempleado` | `Integer` (PK, auto) | Generated identity |
+| `nombre` | `nombre` | `String` (max 80, required) | First name |
+| `apellidoPaterno` | `apellido_paterno` | `String` (max 45, required) | Paternal surname |
+| `apellidoMaterno` | `apellido_materno` | `String` (max 45, required) | Maternal surname |
+| `correo` | `correo` | `String` (max 45, unique, required) | Login email address |
+| `contrasena` | `contrasena` | `String` (max 255, required) | Login password |
+
+A `@Transient` computed getter provides the full display name:
+
+```java
+@Transient
+public String getNombreCompleto() {
+    return (nombre != null ? nombre : "") + " " +
+           (apellidoPaterno != null ? apellidoPaterno : "") + " " +
+           (apellidoMaterno != null ? apellidoMaterno : "");
+}
+```
+
+`getNombreCompleto()` is used throughout the admin UI to display the employee in rental assignment dropdowns and in the `entregado` / `recogido` audit fields on a `Renta` record.
+
+## CRUD via `FacadeEmpleado`
+
+All employee persistence flows through `FacadeEmpleado` in the `negocio` module:
+
+| Method | Description |
+|---|---|
+| `getAllEmpleados()` | Returns the full list of employees; used to populate assignment dropdowns |
+| `saveEmpleado(Empleado)` | Persists a new employee; throws on duplicate `correo` |
+| `updateEmpleado(Empleado)` | Updates an existing employee record, including password resets |
+| `deleteEmpleado(Empleado)` | Hard-deletes the employee; blocked if pending assignments exist |
+| `findById(Integer)` | Retrieves a single employee by primary key |
+| `tieneAsignacionesPendientes(Integer)` | Returns `true` if the employee is currently assigned to an active rental |
+
+`tieneAsignacionesPendientes()` is checked before every deletion to prevent removing an employee who is in the middle of a delivery or collection. An `IllegalStateException` is raised in that case and surfaced to the admin as a toast notification.
+
+## Managing Employees from the Admin Panel
+
+`EmpleadoBeanUI` (`@Named("empleadoUI")`, `@ViewScoped`) backs the **AdminEmpleados.xhtml** page. Key operations:
+
+**Creating an employee:**
+
+```java
+// Called when the admin submits the new-employee form
+public void guardarEmpleado() {
+    // Validates nombre, apellidos, correo format, and contrasena
+    facadeEmpleado.saveEmpleado(nuevoEmpleado);
+    cargarEmpleados(); // Refreshes the table
+}
+```
+
+The bean validates that name fields are non-empty, that the email matches `^[^@\s]+@[^@\s]+\.[^@\s]+$`, and that a password is provided before calling the facade. Duplicate email errors are caught and surfaced with a user-friendly message.
+
+**Searching employees:** a `buscarNombre` field performs a case-insensitive substring match across `nombre`, `apellidoPaterno`, `apellidoMaterno`, and `correo` in the `getEmpleados()` getter — no round-trip to the database required.
+
+**Resetting a password:** `restablecerContrasena()` sets `empleadoSeleccionado.contrasena` to the value in `nuevaContrasena` and calls `updateEmpleado()`. The password is stored as provided; see the warning below.
+
+**Deleting an employee:** `prepararEliminacion()` calls `tieneAsignacionesPendientes()` and blocks the confirmation dialog if assignments are found. `eliminarEmpleadoPorId(Integer)` is the preferred parametric variant that does not depend on the `empleadoSeleccionado` session state.
+
+## Employee Login and View Routing
+
+`LoginBeanUI` determines the post-login destination based on the user type returned by the authentication query:
+
+- **`Empleado`** → redirected to **RentasEmpleado.xhtml**
+- **`Administrador`** → redirected to **principalAdministrador.xhtml**
+
+The logged-in `Empleado` object is stored in `LoginBeanUI.usuario` and injected into `EmpleadoRentaBeanUI` via `@Inject`. The employee identity is validated at `@PostConstruct`:
+
+```java
+@PostConstruct
+public void init() {
+    rentaHelper = new RentaHelper();
+    if (loginBean != null && loginBean.getUsuario() instanceof Empleado) {
+        this.empleadoLogueado = (Empleado) loginBean.getUsuario();
+        cargarRentas();
+    }
+}
+```
+
+If no valid `Empleado` session is found, the rental list is left empty and a console warning is logged.
+
+## Employee Rental View
+
+`EmpleadoRentaBeanUI` (`@Named("empleadoRentaUI")`, `@ViewScoped`) backs **RentasEmpleado.xhtml**. It loads rentals filtered to those the employee can act on:
+
+```java
+// Only rentals that are unassigned OR assigned to this employee
+public void cargarRentas() {
+    this.rentasPendientes = rentaHelper
+        .obtenerRentasDisponiblesYAsignadas(this.empleadoLogueado.getId());
+}
+```
+
+From this list, the employee can click a rental to navigate to **DetalleRentaEmpleado.xhtml** via `irADetalle(Renta)`. On the detail page, `cargarRentaSeleccionada()` loads the full `Renta` and computes `siguienteEstado` from `RentaHelper.calcularSiguienteEstado()`.
+
+### Advancing a Rental State
+
+`verificarSiRequiereComentario()` checks whether the next state needs a delivery or collection note:
+
+- **`Entregado` or `Finalizada`** → opens the comment dialog (`dlgComentarioEstado`), sets `tituloDialogoComentario` appropriately, and waits for `confirmarCambioConComentario()`.
+- **All other states** → calls `avanzarEstado()` directly.
+
+`avanzarEstado()` handles three additional side-effects automatically:
+
+| Transition to | Auto-set fields |
+|---|---|
+| `En reparto` / `En recoleccion` | `Renta.idEmpleado` ← current employee (self-assignment) |
+| `Entregado` | `Renta.entregado` ← employee name; `Renta.idEmpleado` cleared |
+| `Finalizada` | `Renta.recogido` ← employee name; `Renta.idEmpleado` cleared |
+
+After each state change the employee list is refreshed so completed rentals disappear from the queue automatically.
+
+## Creating the First Employee Account
+
+The very first employee account must be created by an administrator from **AdminEmpleados.xhtml**. Log in with an `Administrador` account, navigate to the employee management section, and use the new-employee form. Subsequent employees can also be created from the same interface at any time.
+
+<Warning>
+Employee passwords are stored in the `contrasena` column exactly as entered — the current codebase explicitly notes that BCrypt was removed to avoid double-encryption. For production deployments, you must add a hashing step (e.g. BCrypt via Spring Security Crypto or the Argon2 Jakarta Security API) in `EmpleadoBeanUI.guardarEmpleado()` and `restablecerContrasena()` before writing to the database. Never store plaintext credentials in a production environment.
+</Warning>

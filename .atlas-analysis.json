@@ -1,0 +1,109 @@
+{
+  "projectType": "saas",
+  "projectName": "SiCom — Eventos Campestre",
+  "projectDescription": "A full-stack Java EE rental-management system for an event-rental business, covering article catalog, shopping cart, quotation/rental lifecycle, employee assignment, inventory tracking, and analytics dashboards.",
+  "theme": "almond",
+  "primaryColor": "#3f4737",
+  "lightColor": "#e8dfd3",
+  "darkColor": "#1d1d1b",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Core Features",
+            "pages": [
+              "features/catalog",
+              "features/quotations-and-rentals",
+              "features/inventory",
+              "features/employees",
+              "features/dashboard"
+            ]
+          },
+          {
+            "group": "User Roles",
+            "pages": [
+              "roles/administrator",
+              "roles/employee",
+              "roles/client"
+            ]
+          },
+          {
+            "group": "Setup & Deployment",
+            "pages": [
+              "setup/requirements",
+              "setup/database",
+              "setup/build-and-deploy"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Data Model",
+            "pages": [
+              "reference/entities",
+              "reference/rental-states",
+              "reference/stock-management"
+            ]
+          },
+          {
+            "group": "Business Layer",
+            "pages": [
+              "reference/facade-api",
+              "reference/dao-layer"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Article catalog with categories (MESA, TEXTIL, SILLA, CARPA, COOLER, CALENTON) and image management",
+    "Shopping cart with date-range selection and real-time stock availability checks",
+    "Quotation-to-rental lifecycle with configurable state machine (Solicitada → Aprobada → Confirmado → Pendiente a reparto → En reparto → Entregado → Pendiente a recoleccion → En recoleccion → Finalizada / Cancelada)",
+    "Daily stock reservation system backed by stored procedures",
+    "Employee management with role-based routing (Administrador vs. Empleado)",
+    "Analytics dashboards for rentals, quotations, client growth, and top articles",
+    "Table-combination (CombinacionMesa) configurator linking mesa + mantel + camino + cubre",
+    "Warehouse movement card (TarjetaAlmacen) for daily and range inventory audits",
+    "Google Drive integration for image uploads",
+    "Email notifications via Angus Mail (Jakarta Mail)"
+  ],
+  "publicApiSurface": [
+    "FacadeArticulo.listarCatalogoCliente()",
+    "FacadeArticulo.obtenerArticulos()",
+    "FacadeArticulo.crearArticuloConImagen(Articulo, Imagen)",
+    "FacadeRenta.obtenerCotizaciones()",
+    "FacadeRenta.obtenerRentas()",
+    "FacadeRenta.registrarRenta(Cliente, List<Detallerenta>, LocalDate, LocalDate, LocalTime, String)",
+    "FacadeRenta.cambiarEstado(Integer, String)",
+    "FacadeRenta.actualizarRentaConStock(Renta, LocalDate, LocalDate)",
+    "FacadeRenta.obtenerRentasDisponiblesYAsignadas(Integer)",
+    "FacadeEmpleado (via DelegateEmpleado)",
+    "FacadeDashboard.calcularMetricas(String rangoSeleccionado, int diasN)",
+    "FacadeCombinacionMesa",
+    "FacadeTarjetaAlmacen",
+    "FacadeCarrito",
+    "FacadeLogin (Administrador + Empleado authentication)",
+    "stored procedure: cambiar_estado_renta(p_idRenta INT, p_nuevoEst VARCHAR)",
+    "Entity: Articulo (id, nombre, categoria, precio, unidades, activo, imagen, forma, textilTipo)",
+    "Entity: Renta (id, estado, idCliente, hora, fechaInicio, fecha, idEmpleado, entregado, recogido, total, detallesRenta)",
+    "Entity: Cliente (id, nombre, telefono, direccion)",
+    "Entity: Empleado (id, nombre, apellidoPaterno, apellidoMaterno, correo, contrasena)",
+    "Entity: CombinacionMesa",
+    "Entity: MovimientoAlmacen",
+    "Entity: StockDiario / StockReservadoDiario"
+  ]
+}

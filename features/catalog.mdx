@@ -1,0 +1,140 @@
+---
+title: "Managing the Article Catalog in SiCom"
+sidebarTitle: "Catalog"
+description: "Learn how to create, filter, and manage rentable articles by category, control images, set pricing, and configure table-textile combinations."
+---
+
+The catalog module is the foundation of SiCom's rental operation. Every rentable item — from round tables and garden chairs to event tents, coolers, and heaters — is registered here as an `Articulo`. Administrators maintain the full list through the **Articulos.xhtml** admin view, while clients browse a filtered, stock-aware version on **principal_cliente.xhtml**. An article must be both active and have stock available before it appears in the client-facing catalog.
+
+## The `Articulo` Entity
+
+Each article is persisted to the `articulo` table and carries the following fields:
+
+| Field | Column | Type | Notes |
+|---|---|---|---|
+| `id` | `idarticulo` | `Integer` (PK, auto) | Generated identity |
+| `nombre` | `nombre` | `String` (max 80 chars) | Required; duplicate names rejected |
+| `categoria` | `categoria` | `Categoria` enum | Required; stored as `VARCHAR(10)` |
+| `precio` | `precio` | `BigDecimal` (10,2) | Must be greater than 0 |
+| `unidades` | `unidades` | `Integer` | Total stock available for rental |
+| `activo` | `activo` | `boolean` | Defaults to `true`; toggleable |
+| `imagen` | `imagen_id` | `Imagen` (1:1 FK) | Stored as `byte[]` with MIME type |
+| `forma` | `forma` | `Forma` enum (nullable) | Relevant for MESA and TEXTIL articles |
+| `textilTipo` | `textil_tipo` | `TextilTipo` enum (nullable) | Only set on `TEXTIL` articles |
+
+## Article Categories (`Categoria`)
+
+SiCom supports six article categories, each mapped to a Spanish-language rental type:
+
+| Value | Description |
+|---|---|
+| `MESA` | Tables — available in round and rectangular forms |
+| `TEXTIL` | Linens — manteles, caminos de mesa, and cubremanteles |
+| `SILLA` | Chairs — typically Garden or Lifetime styles |
+| `CARPA` | Event tents — small and large sizes grouped by name |
+| `COOLER` | Coolers for beverage service |
+| `CALENTON` | Outdoor heaters |
+
+## Shape and Textile Subtype Enums
+
+Two auxiliary enums refine article classification for catalog grouping and combination matching:
+
+**`Forma`** — applies to `MESA` and `TEXTIL` articles:
+- `REDONDA` — round shape
+- `RECTANGULAR` — rectangular shape
+- `UNIVERSAL` — compatible with both table shapes (used for caminos and cubres)
+
+**`TextilTipo`** — applies exclusively to `TEXTIL` articles:
+- `MANTEL` — full tablecloth; matched by exact `Forma` to its table
+- `CAMINO` — table runner; must match the table's `Forma` or be `UNIVERSAL`
+- `CUBRE` — cubremantel overlay; same compatibility rules as `CAMINO`
+
+## CRUD Operations
+
+All article persistence flows through `FacadeArticulo` in the `negocio` module.
+
+```java
+// Creating an article with its image in a single transaction
+FacadeArticulo facade = new FacadeArticulo();
+
+Articulo articulo = new Articulo();
+articulo.setNombre("Mesa Redonda");
+articulo.setCategoria(Categoria.MESA);
+articulo.setPrecio(new BigDecimal("120.00"));
+articulo.setUnidades(50);
+articulo.setActivo(true);
+articulo.setForma(Forma.REDONDA);
+
+Imagen imagen = new Imagen();
+imagen.setDatos(imageBytes);       // byte[] from upload
+imagen.setMime("image/jpeg");
+
+facade.crearArticuloConImagen(articulo, imagen);
+```
+
+Key facade methods and their behaviour:
+
+| Method | Description |
+|---|---|
+| `crearArticuloConImagen(Articulo, Imagen)` | Validates name uniqueness (case-insensitive trim), then persists both entities atomically |
+| `obtenerArticulos()` | Returns all active articles for the admin table |
+| `listarCatalogoCliente()` | Returns active articles with available stock for the client view |
+| `actualizarArticulo(Articulo)` | Updates fields; re-checks name uniqueness excluding the current ID |
+| `eliminarArticuloPorId(Integer)` | Hard-deletes if no references exist; soft-deletes (`activo=false`) otherwise |
+| `obtenerArticuloConImagenPorId(Integer)` | Eagerly fetches the `Imagen` association to avoid lazy-init issues in JSF |
+
+## Admin Filtering and Pagination
+
+The `ArticuloBeanUI` managed bean (`@Named("articuloUI")`, `@SessionScoped`) drives the admin table at `Articulos.xhtml`. It exposes two filter fields applied simultaneously via `filtrarArticulos()`:
+
+| Field | Default | Behaviour |
+|---|---|---|
+| `filtroNombre` | `""` | Case-insensitive substring match on `nombre` |
+| `filtroTipo` | `""` | Matches `SILLA`, `MESA`, `CARPA`, `COOLER`, `CALENTON`, `MANTEL`, `CAMINO`, or `CUBREMANTEL` against the article's `categoria` (and `textilTipo` for textiles) |
+
+Results are paginated client-side:
+
+| Field | Default | Description |
+|---|---|---|
+| `paginaActual` | `1` | Current page number (1-based) |
+| `registrosPorPagina` | `5` | Records shown per page |
+
+Helper methods `getArticulosPaginados()`, `getTotalPaginas()`, `getRegistroInicio()`, and `getRegistroFin()` expose slice metadata for the pagination controls. Filters reset `paginaActual` to `1` automatically.
+
+## Image Management
+
+Images are stored directly in the database as `byte[]` inside the `Imagen` entity, alongside a `mime` field (`image/jpeg` or `image/png`). The upload flow accepts only JPG and PNG files, validated by both MIME type and file extension.
+
+In the admin bean, `onUpload(FileUploadEvent)` captures the PrimeFaces file upload result into `imagenBytes` and `imagenMime`. As a fallback, a separate `UploadImageServlet` writes the same buffers into the HTTP session under the keys `uploadBytes` and `uploadMime`, which `guardarNuevo()` reads when the PrimeFaces event path is unavailable.
+
+Images are rendered in JSF views via a Base64 Data URL:
+
+```java
+// Encoding an article's stored image for <h:graphicImage>
+public String getImagenBase64(Articulo art) {
+    byte[] imageBytes = art.getImagen().getDatos();
+    String base64 = Base64.getEncoder().encodeToString(imageBytes);
+    String mime   = art.getImagen().getMime();
+    return "data:" + mime + ";base64," + base64;
+}
+```
+
+## Table–Textile Combinations (`CombinacionMesa`)
+
+A `CombinacionMesa` bundles a `MESA` article with a `MANTEL` (required) and optionally a `CAMINO` or `CUBRE` (mutually exclusive) into a single catalog card for clients. Each combination also carries its own `Imagen` and an `activo` flag.
+
+```
+CombinacionMesa
+├── mesa       → Articulo (MESA, required)
+├── mantel     → Articulo (TEXTIL / MANTEL, required)
+├── camino     → Articulo (TEXTIL / CAMINO, optional)
+├── cubre      → Articulo (TEXTIL / CUBRE, optional, mutually exclusive with camino)
+├── imagen     → Imagen (1:1, required)
+└── activo     → boolean
+```
+
+The `CombinacionMesaAdminBeanUI` managed bean (`@Named("combinacionMesaAdminUI")`, `@ViewScoped`) enforces textile compatibility: when a mesa is selected, only manteles matching its exact `Forma` are offered, and caminos/cubres must match the same `Forma` or be `UNIVERSAL`. Selecting a camino clears the cubre field and vice versa. A `UNIQUE` constraint on `(mesa_id, mantel_id, camino_id, cubre_id)` prevents duplicate combinations at the database level.
+
+<Warning>
+Toggling an article's `activo` field to `false` immediately removes it from the client catalog returned by `listarCatalogoCliente()`. If the article is part of an active `CombinacionMesa`, that combination will continue to appear until it is also deactivated or deleted. Always review related combinations before deactivating a MESA or TEXTIL article.
+</Warning>

@@ -1,0 +1,185 @@
+---
+title: "Administrator Role: Full System Access in SiCom"
+sidebarTitle: "Administrator"
+description: "The administrator controls every aspect of SiCom: managing articles, rentals, quotations, employees, inventory tracking, and analytics dashboards."
+---
+
+The administrator is the most privileged actor in SiCom — Eventos Campestre. After authenticating through the shared login screen, an administrator gains access to the complete back-office: the article catalog, the full rental and quotation pipeline, employee management, inventory movement cards, table-linen combination configurator, and a multi-tab analytics dashboard. All protected pages hook into `LoginBeanUI.preventBackAfterLogout()` on every `preRenderView` event, so navigating back after logout immediately redirects to the authentication selector.
+
+## Authentication Flow
+
+The login form at `login.xhtml` binds its fields to the `@SessionScoped` bean `loginUI` (`LoginBeanUI`). When the administrator clicks **Iniciar Sesión**, `loginUI.login()` is invoked:
+
+```java
+// LoginBeanUI.java
+public void login() throws IOException {
+    // ...blank-field guard...
+    Object result = loginHelper.login(correo, contrasena);
+
+    if (result instanceof mx.desarollo.entity.Administrador) {
+        usuario = result;
+        context.getExternalContext().redirect(
+            context.getExternalContext().getRequestContextPath()
+            + "/principalAdministrador.xhtml");
+    } else if (result instanceof mx.desarollo.entity.Empleado) {
+        usuario = result;
+        context.getExternalContext().redirect(
+            context.getExternalContext().getRequestContextPath()
+            + "/RentasEmpleado.xhtml");
+    } else {
+        context.addMessage(null, new FacesMessage(
+            FacesMessage.SEVERITY_WARN,
+            "Usuario o contraseña incorrecta", "Intente de nuevo"));
+    }
+}
+```
+
+`LoginHelper.login()` delegates through `ServiceFacadeLocator → FacadeLogin → DelegateLogin`, which queries the database for a matching credential. When the returned object is an instance of `Administrador`, the session stores it and the browser is redirected to `principalAdministrador.xhtml`. Any other result stays on the login page with a warning message.
+
+## `Administrador` Entity
+
+The `Administrador` JPA entity maps to the `administrador` table in MySQL:
+
+```java
+// mx.desarollo.entity.Administrador
+@Entity
+@Table(name = "administrador")
+public class Administrador {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "idAdmin", nullable = false)
+    private Integer id;
+
+    @Size(max = 45)
+    @NotNull
+    @Column(name = "correo", nullable = false, length = 45)
+    private String correo;
+
+    @Size(max = 100)
+    @NotNull
+    @Column(name = "contrasena", nullable = false, length = 100)
+    private String contrasena;
+}
+```
+
+| Column | Type | Constraint |
+|--------|------|------------|
+| `idAdmin` | `INT` AUTO_INCREMENT | Primary key |
+| `correo` | `VARCHAR(45)` | `NOT NULL` |
+| `contrasena` | `VARCHAR(100)` | `NOT NULL` |
+
+## Pages Accessible to the Administrator
+
+After login, the administrator lands on `principalAdministrador.xhtml`, which displays a card-grid dashboard that links to every back-office section. Every one of these pages fires `#{loginUI.preventBackAfterLogout}` on `preRenderView`.
+
+| Page | Purpose |
+|------|---------|
+| `principalAdministrador.xhtml` | **Home hub** — card grid linking to Inventario, Cotizaciones, Artículos, and Rentas |
+| `Articulos.xhtml` | Create, modify, and delete rentable articles; filter by name; upload product images |
+| `CombinacionMesa.xhtml` | Define table-linen combinations (mesa + mantel + camino/cubre) with preview images |
+| `AdminEmpleados.xhtml` | Register, view, delete, and reset passwords for employee accounts |
+| `Rentas.xhtml` | View all rentals across every status; filter by client name or rental state |
+| `Cotizaciones.xhtml` | View all quotations in `Solicitada` state; search by client name |
+| `Dashboard.xhtml` | **Overview tab** — KPI cards (successful rentals, total revenue, average per rental) with bar and pie charts; configurable time range |
+| `DashboardRentas.xhtml` | Rental-specific analytics tab (linked from Dashboard nav strip) |
+| `DashboardCotizaciones.xhtml` | Quotation analytics tab (linked from Dashboard nav strip) |
+| `DashboardClientes.xhtml` | Client analytics tab (linked from Dashboard nav strip) |
+| `TarjetaAlmacen.xhtml` | Inventory movement card — per-article ledger showing entries, exits, balances, and running totals filtered by date or date range |
+
+### Page Details
+
+- **`principalAdministrador.xhtml`** — Landing page rendered after successful admin login. The four primary cards navigate directly to `TarjetaAlmacen.xhtml`, `Cotizaciones.xhtml`, `Articulos.xhtml`, and `Rentas.xhtml`.
+
+- **`Articulos.xhtml`** — Backed by `articuloUI` (`ArticuloBeanUI`). Supports categories `MESA`, `TEXTIL`, `SILLA`, `CARPA`, `COOLER`, and `CALENTON`. Images are uploaded via a `fetch` `POST` to `upload-image` and stored in the session before saving. Duplicate name detection runs client-side against `window.articulosData`.
+
+- **`CombinacionMesa.xhtml`** — Backed by `combinacionMesaAdminUI`. Selecting a mesa triggers Ajax cascades to populate compatible mantel, camino, and cubre drop-downs. Camino and cubre are mutually exclusive.
+
+- **`AdminEmpleados.xhtml`** — Backed by `empleadoUI` (`EmpleadoBeanUI`). The **Alta** dialog collects `apellidoPaterno`, `apellidoMaterno`, `nombre`, `correo`, and `contrasena`. Deletion is blocked if the employee has pending rental assignments; a 3-second undo toast allows the administrator to cancel the deletion before it commits.
+
+- **`Rentas.xhtml`** — Backed by `rentaUI`. Calls `rentaUI.obtenerTodasLasRentas()` on `preRenderView`. Each rental card shows the client name, phone, and a colour-coded status dot. Clicking a card opens the rental detail view.
+
+- **`Cotizaciones.xhtml`** — Also backed by `rentaUI`, calling `obtenerTodasLasCotizaciones()`. Displays only quotation-state rentals with a client-name search filter.
+
+- **`Dashboard.xhtml`** — Backed by `dashboardBean`. The time-range selector offers **HOY**, **Últimos 30 días**, or a custom **N días** spinner. Metrics compare the current period against the equivalent prior period and show a coloured percentage phrase (`pct-green` / `pct-red`). Charts use PrimeFaces `<p:barChart>` and `<p:pieChart>`.
+
+- **`TarjetaAlmacen.xhtml`** — Backed by `tarjetaAlmacenUI`. Supports two modes toggled by buttons: **Consulta por Día** (single `p:datePicker`) and **Consulta por Rango** (start + end `p:datePicker`). The resulting ledger table shows columns: Fecha, Movimiento (Renta #N), Concepto, Inventario Inicial, Entrada, Salida, Existencia, Precio Unitario, Debe, Haber, Saldo.
+
+## Session Management and Back-Navigation Guard
+
+`LoginBeanUI` is `@SessionScoped`, so the `usuario` field persists for the entire HTTP session. Every protected page registers a `preRenderView` listener:
+
+```xml
+<f:metadata>
+    <f:event type="preRenderView"
+             listener="#{loginUI.preventBackAfterLogout}" />
+</f:metadata>
+```
+
+`preventBackAfterLogout()` sets aggressive no-cache headers and, if no valid session or user is found, redirects immediately to `AutenticacionUsuario.xhtml`:
+
+```java
+public void preventBackAfterLogout() throws IOException {
+    var response = (HttpServletResponse) externalContext.getResponse();
+    response.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    response.setHeader("Pragma", "no-cache");
+    response.setDateHeader("Expires", 0);
+
+    boolean notLoggedIn = (externalContext.getSession(false) == null || usuario == null);
+
+    if (!notLoggedIn && usuario instanceof Administrador admin) {
+        notLoggedIn = (admin.getCorreo() == null || admin.getCorreo().isBlank());
+    }
+
+    if (notLoggedIn) {
+        externalContext.redirect(
+            externalContext.getRequestContextPath() + "/AutenticacionUsuario.xhtml");
+    }
+}
+```
+
+## Logout
+
+Calling `loginUI.logout()` invalidates the Jakarta EE session and redirects to the authentication selector page:
+
+```java
+public void logout() throws IOException {
+    FacesContext.getCurrentInstance()
+        .getExternalContext().invalidateSession();
+    FacesContext.getCurrentInstance()
+        .getExternalContext().redirect(
+            FacesContext.getCurrentInstance()
+                .getExternalContext().getRequestContextPath()
+            + "/AutenticacionUsuario.xhtml");
+}
+```
+
+After logout, any attempt to navigate back to a protected URL is intercepted by `preventBackAfterLogout()` because the session and `usuario` are now null.
+
+## Creating the First Administrator Account
+
+`LoginBeanUI.registrarAdministrador()` constructs an `Administrador` entity from the form fields and persists it through `LoginHelper → FacadeLogin → DelegateLogin`:
+
+```java
+public void registrarAdministrador() {
+    try {
+        Administrador admin = new Administrador();
+        admin.setCorreo(correo);
+        admin.setContrasena(contrasena);
+        loginHelper.saveAdministrador(admin);
+        FacesContext.getCurrentInstance().addMessage(null,
+            new FacesMessage(FacesMessage.SEVERITY_INFO,
+                "Administrador registrado exitosamente", null));
+    } catch (Exception e) {
+        FacesContext.getCurrentInstance().addMessage(null,
+            new FacesMessage(FacesMessage.SEVERITY_ERROR,
+                "Error al registrar administrador", e.getMessage()));
+    }
+}
+```
+
+This method is suitable for bootstrapping the first account. Only `correo` and `contrasena` are required by the `Administrador` entity.
+
+<Note>
+  SiCom uses Jakarta EE session invalidation for authentication — there is no JWT, OAuth, or external identity provider. The `LoginBeanUI` bean is `@SessionScoped`, meaning the `usuario` object lives in the server-side HTTP session. If the application server restarts, all active sessions are lost and users must log in again. In production, passwords should be stored as BCrypt hashes rather than plain text.
+</Note>

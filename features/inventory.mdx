@@ -1,0 +1,117 @@
+---
+title: "Inventory Control and Stock Tracking in SiCom"
+sidebarTitle: "Inventory"
+description: "Explore how SiCom tracks per-day stock availability through daily snapshots, reservation records, warehouse movements, and the audit card view."
+---
+
+SiCom manages inventory at a per-article, per-day granularity. Rather than a single on-hand quantity, the system maintains three complementary layers: a daily stock snapshot (`StockDiario`), a per-day reservation ledger (`StockReservadoDiario`), and a full warehouse movement log (`MovimientoAlmacen`). Together these layers let administrators answer two key questions in real time — "how many units are actually available on a given date?" and "what physical movements have occurred in a date window?"
+
+## Stock Entities
+
+### `StockDiario` — Daily Inventory Snapshot
+
+`StockDiario` records the total available inventory for an article on a specific date. A unique constraint on `(idarticulo, fecha)` ensures only one snapshot row exists per article per day. Rows are created automatically when a rental reaches `Confirmado` state.
+
+| Field | Column | Type | Notes |
+|---|---|---|---|
+| `id` | `id` | `Integer` (PK, auto) | Generated identity |
+| `articulo` | `idarticulo` | `Articulo` (ManyToOne) | The tracked article |
+| `fecha` | `fecha` | `LocalDate` | The calendar day |
+| `inventarioInicial` | `inventario_inicial` | `Integer` | Stock at the start of the day |
+| `existenciaFinal` | `existencia_final` | `Integer` | Stock at the end of the day |
+
+### `StockReservadoDiario` — Per-Day Reservation Ledger
+
+`StockReservadoDiario` tracks how many units of each article are reserved on each specific calendar day. Every approval of a rental inserts or increments rows for every day in the rental's `[fechaInicio, fecha]` range; every cancellation or completion decrements (and removes zero rows).
+
+| Field | Column | Type | Notes |
+|---|---|---|---|
+| `id` | `id_stock_reservado` | `Long` (PK, auto) | Generated identity |
+| `idarticulo` | `idarticulo` | `Articulo` (ManyToOne) | The reserved article |
+| `fecha` | `fecha` | `LocalDate` | The reserved calendar day |
+| `cantidadReservada` | `cantidad_reservada` | `Integer` (UNSIGNED) | Total units reserved on this day |
+
+### `MovimientoAlmacen` — Warehouse Movement Log
+
+`MovimientoAlmacen` records every physical entry or exit of articles in the warehouse. Movements are created automatically by `DelegateRenta.registrarMovimientosAutomaticos()` when a rental reaches `Confirmado` (SALIDA) or `Finalizada` (ENTRADA).
+
+| Field | Column | Type | Notes |
+|---|---|---|---|
+| `id` | `id` | `Integer` (PK, auto) | Generated identity |
+| `articulo` | `idarticulo` | `Articulo` (ManyToOne) | Article involved |
+| `renta` | `idrenta` | `Renta` (ManyToOne, nullable) | Source rental |
+| `fecha` | `fecha` | `LocalDate` | Date of the movement |
+| `fechaHoraRegistro` | `fecha_hora_registro` | `LocalDateTime` | Exact timestamp when movement was logged |
+| `tipoMovimiento` | `tipo_movimiento` | `TipoMovimiento` enum | `ENTRADA` or `SALIDA` |
+| `cantidad` | `cantidad` | `Integer` | Units moved |
+| `precioUnitario` | `precio_unitario` | `BigDecimal` (10,2) | Unit price at time of movement |
+| `concepto` | `concepto` | `String` (max 200) | Description, e.g. `"Salida por Renta #12 (Confirmado) - Mesa Redonda"` |
+
+## Available Stock Formula
+
+The stock available to a client for a given article over a date range is:
+
+```
+available(article, day) = article.unidades
+                        − SUM(stock_reservado_diario.cantidad_reservada
+                              WHERE idarticulo = article.id AND fecha = day)
+```
+
+For a **multi-day range** (e.g. `fechaInicio` to `fechaSeleccionada`), availability is the **minimum** of `available(article, day)` across all days in the range. `ArticuloHelper.toCardDTOs()` applies this calculation when building the client catalog, so a client can never add more units than are free on the most-constrained day of their chosen window.
+
+## How the Stored Procedure Updates Reservations
+
+The MySQL stored procedure `cambiar_estado_renta` is the authoritative source of reservation changes:
+
+- **On `Aprobada` or `Confirmado`** (from `SOLICITADA`): iterates every `Detallerenta` and every day in `[fecha_inicio, fecha]`, performing an `INSERT ... ON DUPLICATE KEY UPDATE` that increments `cantidad_reservada`.
+- **On `Cancelada` or `Finalizada`**: iterates the same range, decrementing `cantidad_reservada` to a minimum of 0, then deletes rows where the count reaches zero.
+
+The Java-side `DelegateRenta.liberarReservasCliente()` runs the same release logic as a safety net after the stored procedure call, invoking `StockReservadoDiarioDAO.ajustarStockReservado(idArticulo, dia, -cantidad)` for each day in the range.
+
+## `migration_fecha_inicio.sql`
+
+The `sql/migration_fecha_inicio.sql` script handles the idempotent database migration that introduced multi-day rental support:
+
+1. **Adds `fecha_inicio` column** to the `renta` table if it does not already exist, then back-fills it from `fecha` and makes it `NOT NULL`.
+2. **Creates `idx_renta_fecha_inicio`** index on `renta(fecha_inicio)` for efficient range queries.
+3. **Replaces `cambiar_estado_renta`** with the full range-aware version that iterates `[fecha_inicio, fecha]` instead of a single date.
+
+Run this script once against the `sicom` schema before deploying any version that includes `fechaInicio` in the `Renta` entity:
+
+```sql
+-- Run from MySQL Workbench (execute all, yellow lightning bolt)
+USE sicom;
+SOURCE migration_fecha_inicio.sql;
+```
+
+## Warehouse Card View (`TarjetaAlmacen`)
+
+`TarjetaAlmacenBeanUI` (`@Named("tarjetaAlmacenUI")`, `@SessionScoped`) powers the TarjetaAlmacen admin page. It lets an administrator select an article and a date or range, then generates a movement report row by row.
+
+### Consultation Modes
+
+| Mode | Field | Behaviour |
+|---|---|---|
+| Single-day (`consultaPorRango = false`) | `fechaConsulta` | Calls `generarTarjetaDia()`; retrieves movements for that one day |
+| Date range (`consultaPorRango = true`) | `fechaInicio` → `fechaFin` | Calls `generarTarjetaRango()`; retrieves all movements in the window |
+
+The two activation methods, `activarConsultaPorDia()` and `activarConsultaPorRango()`, toggle `consultaPorRango` and bind to radio or tab controls in the view. Default range at `@PostConstruct` is the last 7 days (`LocalDate.now().minusDays(7)` to `LocalDate.now()`).
+
+### `TarjetaAlmacenDTO` Fields
+
+`TarjetaAlmacenHelper.generarTarjeta(movimientos, inventarioInicial)` converts a list of `MovimientoAlmacen` rows into `TarjetaAlmacenDTO` objects for display. Each DTO exposes the movement date, concept, type (`ENTRADA`/`SALIDA`), quantity, running balance, and unit price, giving administrators a complete ledger view.
+
+### Bean Properties
+
+| Property | Type | Description |
+|---|---|---|
+| `articuloSeleccionadoId` | `Integer` | ID of the article being audited |
+| `fechaConsulta` | `LocalDate` | Date for single-day mode |
+| `fechaInicio` / `fechaFin` | `LocalDate` | Date bounds for range mode |
+| `tarjetaDelDia` | `List<TarjetaAlmacenDTO>` | Generated movement rows |
+| `nombreArticuloSeleccionado` | `String` | Display name of selected article |
+| `consultaPorRango` | `boolean` | `true` = range mode, `false` = single-day mode |
+
+<Tip>
+If the client catalog shows lower-than-expected stock for a date, open the **TarjetaAlmacen** page, select the affected article, switch to range mode, and set the date window to cover the rental period. The movement rows will show every `SALIDA` that reduced the balance on that day, and the `stock_reservado_diario` totals will confirm which approved rentals are holding the reserved units.
+</Tip>

@@ -1,0 +1,129 @@
+---
+title: "Analytics Dashboards for Rentals, Clients, and Revenue"
+sidebarTitle: "Dashboard"
+description: "Discover the four analytics views covering main KPIs with period comparison, rental trends, quotation conversion funnels, and client growth charts."
+---
+
+SiCom's analytics module provides four distinct dashboard views, each focused on a different operational dimension. All four are accessible only to administrators and are backed by `FacadeDashboard`, which centralises all metric queries. Charts are rendered using PrimeFaces' built-in `BarChartModel` and `PieChartModel` components, which wrap Chart.js under the hood and require no additional front-end dependencies.
+
+## Dashboard Views at a Glance
+
+| View (XHTML) | Managed Bean | `@Named` | Scope | Focus |
+|---|---|---|---|---|
+| `Dashboard.xhtml` | `DashboardBeanUI` | `dashboardBean` | `@ViewScoped` | Main KPIs, period comparison bar chart, top-articles pie chart |
+| `DashboardRentas.xhtml` | `DashboardRentasBeanUI` | `dashboardRentasBean` | `@ViewScoped` | Daily rental trend, stacked bar chart, activity heatmap |
+| `DashboardCotizaciones.xhtml` | `DashboardCotizacionesBeanUI` | `dashboardCotizacionesBean` | `@ViewScoped` | Quotation funnel, conversion rate, effectiveness by ticket size |
+| `DashboardClientes.xhtml` | `DashboardClientesBeanUI` | `dashboardClientesBean` | `@ViewScoped` | Client growth line chart, frequency ranking bar chart |
+
+## Main Dashboard — `DashboardBeanUI`
+
+`DashboardBeanUI` is the primary entry point. It computes metrics for a selectable time range and builds two charts on every refresh.
+
+### Range Selection
+
+| `rangoSeleccionado` | Behaviour |
+|---|---|
+| `HOY` | Compares today's figures against yesterday |
+| `ULTIMOS_30` | Compares the last 30 days against the preceding 30-day period |
+| `ULTIMOS_N` | Compares the last N days against the preceding N-day period; `diasN` defaults to `7` |
+
+Calling `updateDashboard()` re-fetches metrics from `FacadeDashboard.calcularMetricas(rangoSeleccionado, diasN)` and rebuilds both chart models.
+
+```java
+// Entry point called at @PostConstruct and on every range change
+public void updateDashboard() {
+    this.metrics = facade.calcularMetricas(rangoSeleccionado, diasN);
+    createBarModel();
+    createPieModel();
+}
+```
+
+### `DashboardMetricsDTO` Fields
+
+`FacadeDashboard.calcularMetricas()` returns a `DashboardMetricsDTO` that carries all the data both charts and the KPI cards need:
+
+| Field | Type | Description |
+|---|---|---|
+| `totalRentas` | `long` | Count of successful rentals in the current period |
+| `dineroRentas` | `BigDecimal` | Revenue from rentals in the current period |
+| `promedioGanancia` | `BigDecimal` | Average revenue per rental in the current period |
+| `totalRentasPct` | `double` | % change in rental count vs. prior period |
+| `dineroRentasPct` | `double` | % change in revenue vs. prior period |
+| `promedioGananciaPct` | `double` | % change in average revenue vs. prior period |
+| `dineroRentasAnterior` | `BigDecimal` | Prior period revenue (for tooltip display) |
+| `promedioGananciaAnterior` | `BigDecimal` | Prior period average revenue (for tooltip display) |
+| `rentasExitosasActual` | `long` | Completed rentals in current period |
+| `rentasExitosasAnterior` | `long` | Completed rentals in prior period |
+| `rentasCanceladasActual` | `long` | Cancelled rentals in current period |
+| `rentasCanceladasAnterior` | `long` | Cancelled rentals in prior period |
+| `cotizacionesActual` | `long` | New quotations in current period |
+| `cotizacionesAnterior` | `long` | New quotations in prior period |
+| `topArticulos` | `List<TopArticuloDTO>` | Top rented articles by quantity |
+| `topArticulosTotalCantidad` | `long` | Sum of quantities across all top articles |
+| `periodoActualInicio` | `Date` | Start of the current comparison window |
+| `periodoActualFin` | `Date` | End of the current comparison window |
+| `periodoAnteriorInicio` | `Date` | Start of the prior comparison window |
+| `periodoAnteriorFin` | `Date` | End of the prior comparison window |
+
+### Bar Chart — Period Comparison
+
+`createBarModel()` builds a grouped `BarChartModel` with two datasets — one for the current period and one for the prior period — and three categories: **Exitosas** (completed rentals), **Canceladas**, and **Cotizaciones**. The dataset labels include the formatted date ranges so the comparison window is always visible in the chart legend.
+
+### Pie Chart — Top Articles
+
+`createPieModel()` builds a `PieChartModel` from `metrics.getTopArticulos()`. Each `TopArticuloDTO` contributes one slice:
+
+| `TopArticuloDTO` Field | Type | Description |
+|---|---|---|
+| `id` | `int` | Article primary key |
+| `nombre` | `String` | Article display name |
+| `cantidad` | `long` | Total units rented in the period |
+| `porcentaje` | `double` | Share of total rented units (set by the facade) |
+
+Up to six distinct colours from the Chart.js default palette are cycled across slices.
+
+### KPI Percentage Helpers
+
+Two bean methods format the comparison deltas for the KPI cards:
+
+```java
+// Returns a colour string: "green", "red", or "gray"
+public String getPctColor(double pct) { ... }
+
+// Returns a formatted string like "+12.5%" or "—" if zero/NaN
+public String formatPct(double pct) { ... }
+```
+
+The phrase methods `getFraseTotalRentas()`, `getFraseDineroRentas()`, and `getFrasePromedioGanancia()` produce human-readable comparison lines such as `"hoy +8.0% vs ayer"` or `"últ. 7 días −3.2% vs previos"`.
+
+## Rentals Dashboard — `DashboardRentasBeanUI`
+
+`DashboardRentasBeanUI` provides a month-scoped view defaulting to the current calendar month (`fechaInicio` = first of month, `fechaFin` = last of month). It exposes two complementary visuals:
+
+- **Stacked bar chart** (`stackedBarModel`): daily counts of completed (green) and cancelled (red) rentals, rendered using `ChartDataSet.setStack("rentas")` to stack both series per day.
+- **Activity heatmap** (`heatmap`): a calendar-style grid of `WeekRow` objects, each containing `HeatCell` entries coloured by rental volume relative to the peak day. High-activity days appear darker green.
+
+KPI cards show `totalCompletadas`, `totalCanceladas`, and `tasaCancelacion` as a percentage string.
+
+## Quotations Dashboard — `DashboardCotizacionesBeanUI`
+
+`DashboardCotizacionesBeanUI` visualises quotation conversion, also scoped to the current month by default. It surfaces:
+
+- **Funnel KPIs**: `cotizacionesCreadas`, `cotizacionesAprobadas`, `cotizacionesPagadas`, and `tasaConversion` (paid ÷ created × 100).
+- **Revenue KPIs**: `montoCotizado` and `montoCerrado` from `CotizacionMontosDTO`.
+- **Funnel stages**: a `List<FunnelStage>` record (label, count, % of created, colour) rendered as progressively narrowing bars.
+- **Effectiveness chart** (`efectividadModel`): a grouped bar chart comparing quoted vs. rented counts across three ticket-size buckets — *Pequeño* (< $5 k), *Mediano* ($5 k–$20 k), and *VIP/Boda* (> $20 k).
+
+## Clients Dashboard — `DashboardClientesBeanUI`
+
+`DashboardClientesBeanUI` tracks client acquisition and engagement over the current month by default. It exposes:
+
+- **KPI counters**: `clientesTotales`, `clientesNuevos`, and `clientesFrecuentes` for the selected date window.
+- **Growth line chart** (`growthModel`): a filled `LineChartModel` showing the cumulative client count by day, sorted chronologically. Day-of-month labels are used on the x-axis.
+- **Frequency ranking bar chart** (`rankingModel`): a horizontal `BarChartModel` displaying the top 10 clients by interaction count, sorted descending.
+
+Both charts are refreshed by calling `recargar()`, which is also triggered when `fechaInicio` or `fechaFin` changes.
+
+<Tip>
+Use `rangoSeleccionado = "ULTIMOS_N"` with different values of `diasN` on the main dashboard to quickly compare short windows (e.g. last 7 vs. previous 7 days) against longer windows (last 30 vs. previous 30 days). The chart legend labels update automatically to show the exact date ranges being compared, making it easy to spot seasonal patterns or the impact of a particular promotion.
+</Tip>

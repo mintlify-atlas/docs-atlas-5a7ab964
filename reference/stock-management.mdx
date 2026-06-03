@@ -1,0 +1,199 @@
+---
+title: "Stock Reservation and Availability — SiCom Reference"
+sidebarTitle: "Stock Management"
+description: "How SiCom computes per-day available inventory using warehouse movements, daily snapshots, and date-range reservations tied to the rental lifecycle."
+---
+
+SiCom uses a three-layer approach to inventory management. The `articulo.unidades` column records the total physical units in the warehouse. The `stock_diario` table snapshots daily opening and closing counts. The `stock_reservado_diario` table accumulates how many units are already committed to approved rentals on any given calendar date. The combination of these three tables lets the system answer the question "how many units of article X can still be rented on day D?" without scanning individual rental records at query time.
+
+---
+
+## Tables and Entities at a Glance
+
+| Layer | Table | Entity | Purpose |
+|---|---|---|---|
+| Physical inventory | `articulo` | `Articulo` | Master unit count (`unidades`) |
+| Daily snapshot | `stock_diario` | `StockDiario` | Opening / closing counts per article per day |
+| Reservation log | `stock_reservado_diario` | `StockReservadoDiario` | Reserved units per article per date, driven by state transitions |
+| Movement audit | `movimiento_almacen` | `MovimientoAlmacen` | Immutable record of every warehouse entry or exit |
+
+---
+
+## Available Stock Formula
+
+To determine how many units of an article can still be rented on a specific date:
+
+```
+availableOnDay(idarticulo, date) =
+    articulo.unidades
+    − SUM(stock_reservado_diario.cantidad_reservada
+          WHERE idarticulo = ? AND fecha = ?)
+```
+
+Because `articulo.unidades` is the ground-truth total, and `stock_reservado_diario` accumulates all approved-but-not-yet-finalised reservations, their difference gives the units still available for new quotations on that date.
+
+---
+
+## StockDiario Entity
+
+`StockDiario` stores a daily inventory snapshot for each article. It is generated (or updated) by the `DelegateTarjetaAlmacen` layer whenever the warehouse card (TarjetaAlmacen) is queried or a new day's snapshot needs initialising.
+
+| Field | Java Type | Column | Description |
+|---|---|---|---|
+| `id` | `Integer` | `id` (PK) | Auto-generated identity |
+| `articulo` | `Articulo` | `idarticulo` (FK) | The article this snapshot belongs to |
+| `fecha` | `LocalDate` | `fecha` | The calendar date |
+| `inventarioInicial` | `Integer` | `inventario_inicial` | Units on hand at the start of the day |
+| `existenciaFinal` | `Integer` | `existencia_final` | Units on hand at the end of the day |
+
+A unique constraint on `(idarticulo, fecha)` ensures at most one snapshot row per article per day. When no row exists for a requested date, `DelegateTarjetaAlmacen.obtenerOCrearStockDiario()` creates a zero-initialised row on demand:
+
+```java
+// DelegateTarjetaAlmacen.java
+public StockDiario obtenerOCrearStockDiario(Integer idArticulo, LocalDate fecha) {
+    var stockDAO = ServiceLocator.getInstanceStockDiarioDAO();
+    return stockDAO.obtenerPorArticuloYFecha(idArticulo, fecha)
+        .orElseGet(() -> {
+            StockDiario nuevo = new StockDiario();
+            nuevo.setArticulo(
+                ServiceLocator.getInstanceArticuloDAO().find(idArticulo).orElse(null));
+            nuevo.setFecha(fecha);
+            nuevo.setInventarioInicial(0);
+            nuevo.setExistenciaFinal(0);
+            stockDAO.save(nuevo);
+            return nuevo;
+        });
+}
+```
+
+---
+
+## StockReservadoDiario Entity
+
+`StockReservadoDiario` is the reservation ledger. Each row represents the cumulative number of units of a single article reserved across all active rentals for a specific calendar date.
+
+| Field | Java Type | Column | Description |
+|---|---|---|---|
+| `id` | `Long` | `id_stock_reservado` (PK) | Auto-generated identity |
+| `idarticulo` | `Articulo` | `idarticulo` (FK) | Reserved article; ON DELETE CASCADE |
+| `fecha` | `LocalDate` | `fecha` | The date units are reserved for |
+| `cantidadReservada` | `Integer` | `cantidad_reservada` | `INT UNSIGNED`; total reserved units for this article on this date |
+
+### How rows are written
+
+Rows are **never written directly by JPA code**. They are exclusively managed by the `cambiar_estado_renta` stored procedure using an upsert pattern:
+
+```sql
+-- Reserve: triggered when Solicitada → Aprobada or Confirmado
+INSERT INTO stock_reservado_diario (idarticulo, fecha, cantidad_reservada)
+VALUES (v_idarticulo, v_dia_actual, v_cantidad)
+ON DUPLICATE KEY UPDATE
+    cantidad_reservada = cantidad_reservada + v_cantidad;
+```
+
+The procedure iterates through each `Detallerenta` row and each day in the rental period `[fechaInicio, fecha]`, creating or incrementing one row per `(idarticulo, fecha)` combination. This means a five-day rental of 10 chairs produces five separate reservation rows for that chair article.
+
+### How rows are released
+
+When a rental moves to `Finalizada` or `Cancelada` (from an active state), the procedure decrements each row and removes zero-quantity rows:
+
+```sql
+-- Release: triggered when active state → Cancelada or Finalizada
+UPDATE stock_reservado_diario
+SET cantidad_reservada = GREATEST(cantidad_reservada - v_cantidad, 0)
+WHERE idarticulo = v_idarticulo AND fecha = v_dia_actual;
+
+DELETE FROM stock_reservado_diario
+WHERE idarticulo = v_idarticulo
+  AND fecha = v_dia_actual
+  AND cantidad_reservada <= 0;
+```
+
+<Note>
+  The `GREATEST(cantidad_reservada - v_cantidad, 0)` guard ensures that `cantidad_reservada` can never go negative, even if data inconsistencies exist (for example, if a reservation row was manually modified). Any row that reaches zero is immediately deleted to keep the table compact.
+</Note>
+
+---
+
+## MovimientoAlmacen Entity
+
+`MovimientoAlmacen` is an immutable audit log of every physical stock movement — rental dispatches, returns, purchases, and write-offs. It is used by the TarjetaAlmacen (warehouse card) feature to reconstruct article history.
+
+| Field | Java Type | Column | Description |
+|---|---|---|---|
+| `id` | `Integer` | `id` (PK) | Auto-generated identity |
+| `articulo` | `Articulo` | `idarticulo` (FK) | Affected article |
+| `renta` | `Renta` | `idrenta` (FK, nullable) | Associated rental, if any |
+| `fecha` | `LocalDate` | `fecha` | Calendar date of the movement |
+| `fechaHoraRegistro` | `LocalDateTime` | `fecha_hora_registro` | Precise timestamp of registration |
+| `tipoMovimiento` | `TipoMovimiento` | `tipo_movimiento` | `ENTRADA` or `SALIDA` (stored as `VARCHAR(10)`) |
+| `cantidad` | `Integer` | `cantidad` | Units moved |
+| `precioUnitario` | `BigDecimal` | `precio_unitario` | `DECIMAL(10,2)` — unit price at movement time |
+| `concepto` | `String` | `concepto` | Max 200 chars; free-text description |
+
+### TipoMovimiento enum
+
+| Value | Meaning |
+|---|---|
+| `ENTRADA` | Units arriving — new stock purchases or rental returns |
+| `SALIDA` | Units leaving — dispatched to rental events or written off |
+
+---
+
+## TarjetaAlmacen — Querying Warehouse Movements
+
+The TarjetaAlmacen page lets administrators view the complete movement history for any article, either for a single day or a date range. All queries are routed through `FacadeTarjetaAlmacen`.
+
+### FacadeTarjetaAlmacen methods
+
+```java
+// Query movements for a single day
+List<MovimientoAlmacen> consultarMovimientosPorFecha(Integer idArticulo, LocalDate fecha);
+
+// Query movements across a date range
+List<MovimientoAlmacen> consultarMovimientosPorRango(
+    Integer idArticulo, LocalDate fechaInicio, LocalDate fechaFin);
+
+// Retrieve the opening inventory for a given day from stock_diario
+int obtenerInventarioInicial(Integer idArticulo, LocalDate fecha);
+
+// Compute daily ENTRADA and SALIDA totals; returns int[]{entradas, salidas}
+int[] calcularTotalesDiarios(Integer idArticulo, LocalDate fecha);
+
+// Persist a new movement record
+void registrarMovimiento(MovimientoAlmacen movimiento);
+```
+
+`calcularTotalesDiarios` returns a two-element `int[]` where index `0` is the sum of all `ENTRADA` movements and index `1` is the sum of all `SALIDA` movements for the given article on the given date.
+
+---
+
+## idx_renta_fecha_inicio Index
+
+The migration script `migration_fecha_inicio.sql` adds a B-tree index on `renta.fecha_inicio` to accelerate the date-range window queries executed by the stored procedure and by the TarjetaAlmacen's range lookups:
+
+```sql
+-- Created idempotently in migration_fecha_inicio.sql
+CREATE INDEX idx_renta_fecha_inicio ON renta(fecha_inicio);
+```
+
+Without this index, every call to `cambiar_estado_renta` would perform a full table scan on `renta` when the procedure reads `fecha_inicio` and `fecha` for the rental, and range-based `MovimientoAlmacen` queries would similarly degrade as the table grows. The migration script checks `INFORMATION_SCHEMA.STATISTICS` before creating the index so it can be run safely on a database that already has it.
+
+---
+
+## End-to-End Stock Flow Example
+
+The following sequence illustrates how stock moves through the system for a three-day rental of 5 chairs (article ID 7, rental ID 99, dates 2025-08-01 to 2025-08-03):
+
+1. **Client submits quotation** → `estado = Solicitada`. No reservation rows written.
+2. **Admin approves** → `CALL cambiar_estado_renta(99, 'Aprobada')`. The procedure inserts or increments three rows in `stock_reservado_diario`:
+
+   ```
+   (idarticulo=7, fecha=2025-08-01, cantidad_reservada=5)
+   (idarticulo=7, fecha=2025-08-02, cantidad_reservada=5)
+   (idarticulo=7, fecha=2025-08-03, cantidad_reservada=5)
+   ```
+
+3. **Rental progresses** through `Pendiente a reparto → En reparto → Entregado → Pendiente a recoleccion → En recoleccion`. No stock table changes during these transitions.
+4. **Rental finalised** → `CALL cambiar_estado_renta(99, 'Finalizada')`. The procedure decrements all three rows by 5; rows at zero are deleted.
+5. **Movements logged** by the application when articles leave and return to the warehouse as `MovimientoAlmacen` records of type `SALIDA` (dispatch) and `ENTRADA` (return).

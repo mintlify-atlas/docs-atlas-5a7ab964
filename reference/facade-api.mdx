@@ -1,0 +1,931 @@
+---
+title: "Business Layer Facade API Reference for SiCom"
+sidebarTitle: "Facade API"
+description: "Complete reference for all eight Facade classes in the negocio module — public methods, parameters, return types, and the ServiceFacadeLocator factory."
+---
+
+The `negocio` module (Maven artifact `negocio`) houses the entire business layer of SiCom. All business logic lives in the package `mx.desarollo.facade`, organised around a classic **Facade → Delegate → DAO** layering. A `Facade` class exposes coarse-grained operations to JSF backing beans; each Facade owns one or more `Delegate` instances (package `mx.desarollo.delegate`) that translate high-level requests into fine-grained DAO calls in the `persistencia` module. This two-step indirection keeps JSF beans free of persistence concerns and keeps the DAO layer free of business rules.
+
+<Note>
+Delegate classes are instantiated directly inside each Facade constructor using `new DelegateXxx()`. No CDI, no injection, no container lifecycle — this is a deliberate manual Facade pattern. If you introduce dependency injection in a future iteration, the Facade constructors are the only place that needs to change.
+</Note>
+
+---
+
+## ServiceFacadeLocator
+
+**Package:** `mx.desarollo.integration`
+
+`ServiceFacadeLocator` is a static factory that hands out lazily-initialised, module-scoped singleton instances of every Facade class. Each `getInstanceFacadeXxx()` method uses the standard null-check pattern:
+
+```java
+// mx.desarollo.integration.ServiceFacadeLocator (excerpt)
+public static FacadeArticulo getInstanceFacadeArticulo() {
+    if (facadeArticulo == null) {
+        facadeArticulo = new FacadeArticulo();
+    }
+    return facadeArticulo;
+}
+```
+
+Registered Facades and their accessor methods:
+
+| Facade class | Accessor |
+|---|---|
+| `FacadeLogin` | `ServiceFacadeLocator.getInstanceFacadeLogin()` |
+| `FacadeArticulo` | `ServiceFacadeLocator.getInstanceFacadeArticulo()` |
+| `FacadeRenta` | `ServiceFacadeLocator.getInstanceFacadeRenta()` |
+| `FacadeEmpleado` | `ServiceFacadeLocator.getInstanceFacadeEmpleado()` |
+| `FacadeCombinacionMesa` | `ServiceFacadeLocator.getInstanceFacadeCombinacionMesa()` |
+| `FacadeTarjetaAlmacen` | `ServiceFacadeLocator.getInstanceFacadeTarjetaAlmacen()` |
+
+`FacadeDashboard` and `FacadeCarrito` are **not** registered in `ServiceFacadeLocator`; backing beans that need them instantiate them directly with `new FacadeDashboard()` / `new FacadeCarrito()`.
+
+### Usage example
+
+```java
+import mx.desarollo.integration.ServiceFacadeLocator;
+import mx.desarollo.entity.Articulo;
+import java.util.List;
+
+// Obtain a Facade — the same instance is returned on every call
+FacadeArticulo facadeArticulo = ServiceFacadeLocator.getInstanceFacadeArticulo();
+
+// List catalog items visible to clients
+List<Articulo> catalog = facadeArticulo.listarCatalogoCliente();
+
+// Retrieve a rental by ID and change its state
+FacadeRenta facadeRenta = ServiceFacadeLocator.getInstanceFacadeRenta();
+facadeRenta.cambiarEstado(42, "Confirmado");
+```
+
+---
+
+## FacadeArticulo
+
+**Package:** `mx.desarollo.facade`  
+**Delegate:** `DelegateArticulo`
+
+Manages the full lifecycle of rental articles: catalogue display, creation with an associated image, retrieval, update, and soft-/hard-delete. All name uniqueness checks are applied at the Facade level before any persistence call is made.
+
+### `listarCatalogoCliente()`
+
+```java
+public List<Articulo> listarCatalogoCliente()
+```
+
+Returns the subset of articles that should be visible on the client-facing catalogue. Delegates to `DelegateArticulo.listarCatalogoCliente()`, which calls `ArticuloDAO.listarActivosConStock()` — a JPQL query that filters for `activo = true AND unidades > 0`, ordered by category and name, with the `Imagen` association eagerly fetched to avoid `LazyInitializationException` in JSF.
+
+**Returns:** `List<Articulo>` — may be empty; never `null`.
+
+---
+
+### `obtenerArticulos()`
+
+```java
+public List<Articulo> obtenerArticulos()
+```
+
+Fetches all articles regardless of stock level, then filters in-memory to include only those where `activo = true`. Used in administration screens where soft-deleted articles must be hidden but stock-zero articles are still manageable.
+
+**Returns:** `List<Articulo>` — active articles only; never `null`.
+
+---
+
+### `crearArticuloConImagen(Articulo articulo, Imagen imagen)`
+
+```java
+public void crearArticuloConImagen(Articulo articulo, Imagen imagen)
+```
+
+Creates a new article and its associated image in a single transaction. Business-rule validations applied before persistence:
+
+1. `articulo` must not be `null`.
+2. `articulo.getNombre()` must not be blank after trimming.
+3. No existing article may share the same name (case- and whitespace-insensitive check via `DelegateArticulo.existsArticuloByNombre`).
+
+If all checks pass, the name is normalised with `trim()` and both entities are persisted atomically by `ArticuloDAO.saveWithImage`.
+
+<ParamField path="articulo" type="Articulo" required>
+  The article entity to persist. Must have a non-blank `nombre`. The `id` field must be `null` (new record).
+</ParamField>
+
+<ParamField path="imagen" type="Imagen" required>
+  The image entity to associate with the article. Persisted first so its generated ID can be set on the article before the article is persisted.
+</ParamField>
+
+**Returns:** `void`  
+**Throws:** `IllegalArgumentException` if `articulo` is `null`, the name is blank, or the name already exists.
+
+---
+
+### `eliminarArticuloPorId(Integer id)`
+
+```java
+public void eliminarArticuloPorId(Integer id)
+```
+
+Attempts a hard-delete of the article with the given primary key. If the database rejects the deletion (e.g. due to a foreign-key constraint from existing rental details), the method falls back to a **soft-delete**: it loads the article via `findByIdWithImage`, sets `activo = false`, and calls `updateArticulo`. This ensures referential integrity is never broken.
+
+<ParamField path="id" type="Integer" required>
+  Primary key of the article to delete or deactivate.
+</ParamField>
+
+**Returns:** `void`
+
+---
+
+### `obtenerArticuloPorId(Integer id)`
+
+```java
+public Optional<Articulo> obtenerArticuloPorId(Integer id)
+```
+
+Looks up an article by its primary key without pre-fetching the `Imagen` association.
+
+<ParamField path="id" type="Integer" required>
+  Primary key of the article.
+</ParamField>
+
+**Returns:** `Optional<Articulo>` — empty if no article with that ID exists.
+
+---
+
+### `obtenerArticuloConImagenPorId(Integer id)`
+
+```java
+public Optional<Articulo> obtenerArticuloConImagenPorId(Integer id)
+```
+
+Loads an article with its `Imagen` association eagerly fetched via `JOIN FETCH`. Use this variant in JSF views that render the article image to prevent `LazyInitializationException` after the `EntityManager` is closed.
+
+<ParamField path="id" type="Integer" required>
+  Primary key of the article.
+</ParamField>
+
+**Returns:** `Optional<Articulo>` with `imagen` populated; empty if the article does not exist.
+
+---
+
+### `actualizarArticulo(Articulo articulo)`
+
+```java
+public void actualizarArticulo(Articulo articulo)
+```
+
+Persists changes to an existing article. Applies the same name-uniqueness validation as `crearArticuloConImagen`, but excludes the article being updated from the duplicate check using `existsArticuloByNombreExcludingId`.
+
+<ParamField path="articulo" type="Articulo" required>
+  The detached article entity with updated fields. `articulo.getId()` must not be `null`.
+</ParamField>
+
+**Returns:** `void`  
+**Throws:** `IllegalArgumentException` if `articulo` is `null`, its `id` is `null`, the name is blank, or another article already uses that name.
+
+---
+
+## FacadeRenta
+
+**Package:** `mx.desarollo.facade`  
+**Delegate:** `DelegateRenta`
+
+Central facade for all rental and quotation operations, including state transitions, stock reservation management, employee assignment queries, and comment handling.
+
+### `obtenerCotizaciones()`
+
+```java
+public List<Renta> obtenerCotizaciones()
+```
+
+Returns all rentals in state `SOLICITADA` (pending quotations awaiting administrator review). Each `Renta` is returned with its `detallesRenta` collection and the associated `Articulo` per detail eagerly fetched.
+
+**Returns:** `List<Renta>`
+
+---
+
+### `obtenerRentas()`
+
+```java
+public List<Renta> obtenerRentas()
+```
+
+Returns all rentals **except** those in state `SOLICITADA`. Used in the administrator's rental-management screen to show confirmed, in-progress, and finalised rentals.
+
+**Returns:** `List<Renta>`
+
+---
+
+### `obtenerRentaId(Integer idRenta)`
+
+```java
+public Renta obtenerRentaId(Integer idRenta)
+```
+
+Loads a single rental by primary key with all associations eagerly fetched: `idCliente`, `detallesRenta`, and the `Articulo` within each detail.
+
+<ParamField path="idRenta" type="Integer" required>
+  Primary key of the rental.
+</ParamField>
+
+**Returns:** `Renta` — `null` if no rental with that ID exists.
+
+---
+
+### `cambiarEstado(Integer idRenta, String nuevoEstado)`
+
+```java
+public void cambiarEstado(Integer idRenta, String nuevoEstado)
+```
+
+Transitions a rental to a new state. The call chain is:
+
+1. **`RentaDAO.cambiarEstadoRenta`** — executes the MySQL stored procedure `CALL cambiar_estado_renta(:idRent, :nuevoEst)` inside its own transaction.
+2. **`DelegateRenta.registrarMovimientosAutomaticos`** — for state `Confirmado` or `Finalizada`, creates a `MovimientoAlmacen` record (SALIDA or ENTRADA respectively) for every article in the rental's detail lines and updates `StockDiario`.
+3. **`DelegateRenta.liberarReservasCliente`** — for state `Finalizada` or `Cancelada`, decrements `StockReservadoDiario` entries for every day in the rental range `[fechaInicio, fecha]`.
+
+<ParamField path="idRenta" type="Integer" required>
+  Primary key of the rental to transition.
+</ParamField>
+
+<ParamField path="nuevoEstado" type="String" required>
+  Target state string. Valid values include `"Confirmado"`, `"Finalizada"`, `"Cancelada"`, `"En reparto"`, `"En recoleccion"`, `"Pendiente a reparto"`, `"Pendiente a recoleccion"`.
+</ParamField>
+
+**Returns:** `void`
+
+---
+
+### `actualizarRenta(Renta renta)`
+
+```java
+public void actualizarRenta(Renta renta)
+```
+
+Merges changes to an existing rental entity without touching stock or reservation tables. Use this for updating simple fields (e.g. employee assignment, total amount) when no date or quantity change has occurred.
+
+<ParamField path="renta" type="Renta" required>
+  Detached `Renta` entity with updated fields. Must have a non-null `id`.
+</ParamField>
+
+**Returns:** `void`
+
+---
+
+### `registrarRenta(Cliente, List<Detallerenta>, LocalDate, LocalDate, LocalTime, String)`
+
+```java
+public void registrarRenta(
+    Cliente cliente,
+    List<Detallerenta> detalles,
+    LocalDate fechaInicio,
+    LocalDate fecha,
+    LocalTime hora,
+    String estado
+)
+```
+
+Creates a new rental (or quotation) from a shopping-cart checkout. The entire operation is transactional: if `cliente.getId()` is `null` the client is persisted first; the `Renta` header is saved next with its computed `total`; then each `Detallerenta` is linked to the new rental and persisted.
+
+<ParamField path="cliente" type="Cliente" required>
+  The client placing the rental. May be a new (unsaved) or existing entity.
+</ParamField>
+
+<ParamField path="detalles" type="List&lt;Detallerenta&gt;" required>
+  Line items describing each article and quantity. `precioUnitario` defaults to the article's current `precio` if not set.
+</ParamField>
+
+<ParamField path="fechaInicio" type="LocalDate" required>
+  Date articles are dispatched / pickup begins.
+</ParamField>
+
+<ParamField path="fecha" type="LocalDate" required>
+  Return / delivery date (end of rental period).
+</ParamField>
+
+<ParamField path="hora" type="LocalTime" required>
+  Delivery or event time on `fecha`.
+</ParamField>
+
+<ParamField path="estado" type="String" required>
+  Initial state of the record; typically `"SOLICITADA"` for a client quotation.
+</ParamField>
+
+**Returns:** `void`
+
+---
+
+### `obtenerRentasDisponiblesYAsignadas(Integer idEmpleado)`
+
+```java
+public List<Renta> obtenerRentasDisponiblesYAsignadas(Integer idEmpleado)
+```
+
+Returns the task list for an employee's dispatch/collection screen. The result set includes three groups:
+
+1. Rentals in `Pendiente a reparto` with no employee assigned yet (available for self-assignment).
+2. All rentals in `Pendiente a recoleccion` (public, any employee may take them).
+3. Rentals already assigned to `idEmpleado` in states `En reparto` or `En recoleccion`.
+
+Results are ordered by `fechaInicio ASC, hora ASC`.
+
+<ParamField path="idEmpleado" type="Integer" required>
+  Primary key of the currently-authenticated employee.
+</ParamField>
+
+**Returns:** `List<Renta>` — `null` if no results are found (propagated `NoResultException`).
+
+---
+
+### `obtenerComentarios(Integer idRenta)`
+
+```java
+public List<Comentario> obtenerComentarios(Integer idRenta)
+```
+
+Fetches all comments associated with a rental, ordered by persistence sequence.
+
+<ParamField path="idRenta" type="Integer" required>
+  Primary key of the rental whose comments are requested.
+</ParamField>
+
+**Returns:** `List<Comentario>` — empty list if `idRenta` is `null` or no comments exist.
+
+---
+
+### `guardarComentario(Comentario comentario)`
+
+```java
+public void guardarComentario(Comentario comentario)
+```
+
+Persists a new comment linked to a rental. The `Comentario` entity must already have its `idRenta` association set before this call.
+
+<ParamField path="comentario" type="Comentario" required>
+  The comment entity to persist. Must reference a valid `Renta` via `idRenta`.
+</ParamField>
+
+**Returns:** `void`
+
+---
+
+### `actualizarRentaConStock(Renta, LocalDate, LocalDate)`
+
+```java
+public void actualizarRentaConStock(Renta renta,
+                                    LocalDate fechaInicioAnterior,
+                                    LocalDate fechaAnterior) throws Exception
+```
+
+Full transactional update of a rental when dates or quantities may have changed. The delegate performs a three-phase reconciliation:
+
+1. **Removed details** — for line items present in the database but absent from `renta.getDetallesRenta()`, the reserved stock for the original date range is decremented and the `Detallerenta` row is deleted.
+2. **Date-change path** — if either date boundary changed, the entire previous reservation is released and new reservations are created for the new range, with availability validated first.
+3. **Quantity-change path** — if only quantities changed (dates unchanged), only the net delta is applied to `StockReservadoDiario`.
+
+<ParamField path="renta" type="Renta" required>
+  The rental entity with updated header fields and detail list. Must have a non-null `id`.
+</ParamField>
+
+<ParamField path="fechaInicioAnterior" type="LocalDate" required>
+  The `fechaInicio` value **before** the edit, needed to release previous reservations from the correct range.
+</ParamField>
+
+<ParamField path="fechaAnterior" type="LocalDate" required>
+  The `fecha` (end date) value **before** the edit.
+</ParamField>
+
+**Returns:** `void`  
+**Throws:** `Exception` if stock is insufficient for the new configuration or if the transaction fails.
+
+---
+
+## FacadeEmpleado
+
+**Package:** `mx.desarollo.facade`  
+**Delegate:** `DelegateEmpleado`
+
+CRUD operations for employee records, with password hashing delegated to `DelegateEmpleado` via jBCrypt. All password hashing (cost factor 12) occurs inside the delegate before any DAO call.
+
+### `getAllEmpleados()`
+
+```java
+public List<Empleado> getAllEmpleados()
+```
+
+Returns the complete list of employee records from the database via `EmpleadoDAO.findAll()`.
+
+**Returns:** `List<Empleado>`
+
+---
+
+### `saveEmpleado(Empleado empleado)`
+
+```java
+public void saveEmpleado(Empleado empleado)
+```
+
+Persists a new employee. The delegate hashes `empleado.getContrasena()` with BCrypt (cost 12) before calling `EmpleadoDAO.save`.
+
+<ParamField path="empleado" type="Empleado" required>
+  New employee entity. The `contrasena` field must contain the plain-text password to be hashed.
+</ParamField>
+
+**Returns:** `void`
+
+---
+
+### `updateEmpleado(Empleado empleado)`
+
+```java
+public void updateEmpleado(Empleado empleado)
+```
+
+Merges changes to an existing employee. The delegate checks whether `contrasena` differs from the stored BCrypt hash; if the incoming value is a plain-text password (does not start with `$2`), it is hashed before the update. If the employee no longer exists in the database, the password is hashed unconditionally.
+
+<ParamField path="empleado" type="Empleado" required>
+  Detached employee entity. If `contrasena` is a plain-text value it will be hashed; if it is already a BCrypt hash it will be stored unchanged.
+</ParamField>
+
+**Returns:** `void`
+
+---
+
+### `deleteEmpleado(Empleado empleado)`
+
+```java
+public void deleteEmpleado(Empleado empleado)
+```
+
+Permanently removes an employee record. Before calling this, use `tieneAsignacionesPendientes` to prevent deletion of employees with active dispatch/collection assignments.
+
+<ParamField path="empleado" type="Empleado" required>
+  Managed or detached employee entity to delete.
+</ParamField>
+
+**Returns:** `void`
+
+---
+
+### `findById(Integer id)`
+
+```java
+public Empleado findById(Integer id)
+```
+
+Looks up an employee by primary key using a typed JPQL query.
+
+<ParamField path="id" type="Integer" required>
+  Primary key of the employee.
+</ParamField>
+
+**Returns:** `Empleado` — `null` if no employee with that ID exists.
+
+---
+
+### `tieneAsignacionesPendientes(Integer empleadoId)`
+
+```java
+public boolean tieneAsignacionesPendientes(Integer empleadoId)
+```
+
+Checks whether the employee has any rental currently in state `En reparto` or `En recoleccion`. The UI uses this to guard the delete action with a warning dialog.
+
+<ParamField path="empleadoId" type="Integer" required>
+  Primary key of the employee to check.
+</ParamField>
+
+**Returns:** `true` if at least one such rental exists; `false` otherwise.
+
+---
+
+## FacadeDashboard
+
+**Package:** `mx.desarollo.facade`  
+**Delegate:** `DelegateDashboard` (instantiated inline as `private final DelegateDashboard delegate = new DelegateDashboard()`)
+
+Aggregates business metrics for the analytics dashboard. All time-window calculations are performed in the Facade; the Delegate and `DashboardDAO` only receive resolved `Date` boundaries.
+
+### `calcularMetricas(String rango, int nDias)`
+
+```java
+public DashboardMetricsDTO calcularMetricas(String rango, int nDias)
+```
+
+The primary dashboard entry point. Resolves two consecutive time windows — current and prior — then populates a `DashboardMetricsDTO` with counts, totals, averages, percentage changes, and a top-5 article ranking.
+
+Supported `rango` values:
+
+| Value | Resolved window |
+|---|---|
+| `"HOY"` | Today, compared against yesterday |
+| `"ULTIMOS_30"` | Rolling 30-day window ending today, compared against the preceding 30-day block |
+| Any other string | Rolling `nDias`-day window ending today, compared against the preceding `nDias`-day block |
+
+Percentage change for each metric is calculated as `((current - previous) / previous) × 100`. If `previous` is `0`, the change is set to `Double.NaN` so the UI can display `—` instead of a misleading percentage.
+
+The top-5 articles are fetched by `delegate.findTopArticulosVendidos(start, end, 5)` and augmented with a percentage-of-total column. An `"Otros"` entry is appended when the top-5 do not account for the full total.
+
+<ParamField path="rango" type="String" required>
+  Time-window selector. One of `"HOY"`, `"ULTIMOS_30"`, or any other string (uses `nDias`).
+</ParamField>
+
+<ParamField path="nDias" type="int">
+  Number of days for the custom window. Ignored when `rango` is `"HOY"` or `"ULTIMOS_30"`.
+</ParamField>
+
+**Returns:** `DashboardMetricsDTO` — fully-populated DTO with current/prior period boundaries, rental counts, revenue totals, averages, percent changes, and the top-articles list.
+
+---
+
+### `obtenerDailyStatus(Date start, Date end)`
+
+```java
+public List<DailyRentaStatusDTO> obtenerDailyStatus(Date start, Date end)
+```
+
+Returns a per-day breakdown of total rentals, completed rentals, and cancelled rentals within the date range. Used to render the bar/line chart on the dashboard.
+
+<ParamField path="start" type="Date" required>Range start (inclusive).</ParamField>
+<ParamField path="end" type="Date" required>Range end (inclusive).</ParamField>
+
+**Returns:** `List<DailyRentaStatusDTO>`
+
+---
+
+### `obtenerFunnelCotizaciones(Date start, Date end)`
+
+```java
+public CotizacionFunnelDTO obtenerFunnelCotizaciones(Date start, Date end)
+```
+
+Returns the three-stage quotation funnel: total created, those that progressed past quotation status (`aprobadas`), and those that reached `Finalizada` (`pagadas`).
+
+<ParamField path="start" type="Date" required>Range start (inclusive).</ParamField>
+<ParamField path="end" type="Date" required>Range end (inclusive).</ParamField>
+
+**Returns:** `CotizacionFunnelDTO`
+
+---
+
+### `obtenerEfectividadCotizaciones(Date start, Date end)`
+
+```java
+public List<CotizacionEfectividadDTO> obtenerEfectividadCotizaciones(Date start, Date end)
+```
+
+Buckets rentals by total amount (SMALL `< $5,000`, MEDIUM `$5,000–$20,000`, VIP `> $20,000`) and returns the count of quotations versus confirmed rentals in each bucket.
+
+<ParamField path="start" type="Date" required>Range start (inclusive).</ParamField>
+<ParamField path="end" type="Date" required>Range end (inclusive).</ParamField>
+
+**Returns:** `List<CotizacionEfectividadDTO>`
+
+---
+
+### `obtenerMontosCotizaciones(Date start, Date end)`
+
+```java
+public CotizacionMontosDTO obtenerMontosCotizaciones(Date start, Date end)
+```
+
+Compares total quoted amount against the total closed (finalised) amount in the range.
+
+<ParamField path="start" type="Date" required>Range start (inclusive).</ParamField>
+<ParamField path="end" type="Date" required>Range end (inclusive).</ParamField>
+
+**Returns:** `CotizacionMontosDTO` with `montoCotizado` and `montoCerrado` fields.
+
+---
+
+### Client metric methods
+
+```java
+public long obtenerClientesTotales(Date start, Date end)
+public long obtenerClientesNuevos(Date start, Date end)
+public long obtenerClientesFrecuentesCount(Date start, Date end)
+public List<ClienteGrowthPoint> obtenerGrowthClientes(LocalDate inicio, LocalDate fin)
+public List<ClienteFrecuenciaDTO> obtenerClientesFrecuentes(int topN)
+```
+
+| Method | Description |
+|---|---|
+| `obtenerClientesTotales` | Distinct client names regardless of date range (full-table count). |
+| `obtenerClientesNuevos` | Clients whose first-ever rental falls within `[start, end]`. |
+| `obtenerClientesFrecuentesCount` | Clients with more than one non-cancelled, non-quoted rental in the range. |
+| `obtenerGrowthClientes` | Daily cumulative client growth series for the date range (used in line chart). |
+| `obtenerClientesFrecuentes` | Top-N clients ordered by rental frequency (all time). |
+
+<ParamField path="topN" type="int">Maximum number of results to return for `obtenerClientesFrecuentes`.</ParamField>
+
+---
+
+## FacadeLogin
+
+**Package:** `mx.desarollo.facade`  
+**Delegate:** `DelegateLogin`
+
+Authentication facade. Verifies credentials against both the `Administrador` and `Empleado` tables using BCrypt password verification, and provides account creation helpers.
+
+### `login(String password, String correo)`
+
+```java
+public Object login(String password, String correo)
+```
+
+Authenticates a user. The delegate first queries `AdministradorDAO.findByCorreo(correo)`; if a matching record is found and `BCrypt.checkpw(password, admin.getContrasena())` passes, the `Administrador` object is returned. If that check fails, the same logic is applied against `EmpleadoDAO.findByCorreo`. If neither check succeeds, `null` is returned.
+
+<ParamField path="password" type="String" required>
+  Plain-text password submitted by the user.
+</ParamField>
+
+<ParamField path="correo" type="String" required>
+  Email address used as the login identifier.
+</ParamField>
+
+**Returns:** `Administrador` or `Empleado` on success; `null` on failure. The caller is responsible for casting and setting session scope.
+
+---
+
+### `saveAdministrador(Administrador admin)`
+
+```java
+public void saveAdministrador(Administrador admin)
+```
+
+Hashes `admin.getContrasena()` with BCrypt (default cost) and persists the administrator record.
+
+<ParamField path="admin" type="Administrador" required>
+  New administrator entity with a plain-text password in `contrasena`.
+</ParamField>
+
+**Returns:** `void`
+
+---
+
+### `saveEmpleado(Empleado empleado)`
+
+```java
+public void saveEmpleado(Empleado empleado)
+```
+
+Hashes `empleado.getContrasena()` with BCrypt and persists the employee record. Equivalent to `FacadeEmpleado.saveEmpleado` but used in the login/registration flow where only `DelegateLogin` is available.
+
+<ParamField path="empleado" type="Empleado" required>
+  New employee entity with a plain-text password in `contrasena`.
+</ParamField>
+
+**Returns:** `void`
+
+---
+
+## FacadeCarrito
+
+**Package:** `mx.desarollo.facade`  
+**Delegate:** `DelegateCarrito`
+
+Stock availability checks for the shopping-cart flow. All queries are read-only and consult `StockReservadoDAO` to account for reservations already in place for a given date or date range.
+
+### `verificarStock(Articulo articulo, int cantidadSolicitada)`
+
+```java
+public boolean verificarStock(Articulo articulo, int cantidadSolicitada)
+```
+
+Checks raw stock (`articulo.getUnidades()`) without considering any date-based reservations. Useful for same-day or undated requests.
+
+<ParamField path="articulo" type="Articulo" required>Article to check.</ParamField>
+<ParamField path="cantidadSolicitada" type="int" required>Number of units needed.</ParamField>
+
+**Returns:** `true` if `unidades >= cantidadSolicitada` (or if `unidades` is `null`, assumed unlimited).
+
+---
+
+### `verificarStock(Articulo articulo, int cantidadSolicitada, LocalDate fecha)`
+
+```java
+public boolean verificarStock(Articulo articulo, int cantidadSolicitada, LocalDate fecha)
+```
+
+Date-aware stock check. Subtracts already-reserved units for `fecha` from total units before comparing with `cantidadSolicitada`.
+
+<ParamField path="articulo" type="Articulo" required>Article to check.</ParamField>
+<ParamField path="cantidadSolicitada" type="int" required>Units requested.</ParamField>
+<ParamField path="fecha" type="LocalDate" required>Specific date for which to check availability.</ParamField>
+
+**Returns:** `true` if `(unidades - reservado) >= cantidadSolicitada`.
+
+---
+
+### `obtenerDisponibleEnFecha(Articulo articulo, LocalDate fecha)`
+
+```java
+public int obtenerDisponibleEnFecha(Articulo articulo, LocalDate fecha)
+```
+
+Returns the number of units available on a specific date after subtracting existing reservations.
+
+<ParamField path="articulo" type="Articulo" required>Article to query.</ParamField>
+<ParamField path="fecha" type="LocalDate" required>Date to check.</ParamField>
+
+**Returns:** Available unit count; `0` if the article is `null` or `unidades` is `null`.
+
+---
+
+### `verificarStockEnRango(Articulo, int, LocalDate, LocalDate)`
+
+```java
+public boolean verificarStockEnRango(Articulo articulo,
+                                     int cantidadSolicitada,
+                                     LocalDate fechaInicio,
+                                     LocalDate fechaFin)
+```
+
+Multi-day availability check. Finds the day with the highest reservation count (the bottleneck day) across `[fechaInicio, fechaFin]` via `StockReservadoDAO.obtenerMaximoReservadoEnRango` and compares the resulting available quantity against `cantidadSolicitada`.
+
+<ParamField path="articulo" type="Articulo" required>Article to check.</ParamField>
+<ParamField path="cantidadSolicitada" type="int" required>Units requested for the entire period.</ParamField>
+<ParamField path="fechaInicio" type="LocalDate" required>Start of the rental range (inclusive).</ParamField>
+<ParamField path="fechaFin" type="LocalDate" required>End of the rental range (inclusive).</ParamField>
+
+**Returns:** `true` if the article can satisfy the request across every day in the range.
+
+---
+
+### `obtenerDisponibleEnRango(Articulo articulo, LocalDate fechaInicio, LocalDate fechaFin)`
+
+```java
+public int obtenerDisponibleEnRango(Articulo articulo,
+                                    LocalDate fechaInicio,
+                                    LocalDate fechaFin)
+```
+
+Returns the minimum available units across the entire rental range — the worst-case (bottleneck) day.
+
+<ParamField path="articulo" type="Articulo" required>Article to query.</ParamField>
+<ParamField path="fechaInicio" type="LocalDate" required>Range start (inclusive).</ParamField>
+<ParamField path="fechaFin" type="LocalDate" required>Range end (inclusive).</ParamField>
+
+**Returns:** Minimum available unit count across the range.
+
+---
+
+## FacadeCombinacionMesa
+
+**Package:** `mx.desarollo.facade`  
+**Delegate:** `DelegateCombinacionMesa` (instantiated inline)
+
+Manages table-textile combination records used in the visual catalogue. Enforces business rules about category and shape compatibility between the mesa, mantel, camino, and cubre articles before any persistence call.
+
+### `obtenerPorMesaYTextiles(Integer idMesa, Integer idMantel, Integer idCamino, Integer idCubre)`
+
+```java
+public Optional<CombinacionMesa> obtenerPorMesaYTextiles(
+    Integer idMesa, Integer idMantel,
+    Integer idCamino, Integer idCubre)
+```
+
+Looks up an existing combination by the four article IDs. Used for duplicate detection before saving.
+
+<ParamField path="idMesa" type="Integer" required>ID of the table article.</ParamField>
+<ParamField path="idMantel" type="Integer" required>ID of the tablecloth article.</ParamField>
+<ParamField path="idCamino" type="Integer">ID of the table runner article; may be `null`.</ParamField>
+<ParamField path="idCubre" type="Integer">ID of the tablecloth cover article; may be `null`.</ParamField>
+
+**Returns:** `Optional<CombinacionMesa>` — empty if no matching combination exists.
+
+---
+
+### `obtenerTodas()`
+
+```java
+public List<CombinacionMesa> obtenerTodas()
+```
+
+Returns all registered table-textile combinations.
+
+**Returns:** `List<CombinacionMesa>`
+
+---
+
+### `crearOActualizar(CombinacionMesa c)`
+
+```java
+public void crearOActualizar(CombinacionMesa c)
+```
+
+Saves or updates a combination after applying the following business rules:
+
+1. `mesa`, `mantel`, and `imagen` must all be non-null.
+2. `mesa.categoria` must be `Categoria.MESA`.
+3. `mantel.categoria` must be `Categoria.TEXTIL` and `mantel.textilTipo` must be `TextilTipo.MANTEL`. The mantel's `forma` must match the mesa's `forma`.
+4. If `camino` is provided: `camino.textilTipo` must be `TextilTipo.CAMINO` and its `forma` must match the mesa or be `Forma.UNIVERSAL`.
+5. If `cubre` is provided: `cubre.textilTipo` must be `TextilTipo.CUBRE` and its `forma` must match the mesa or be `Forma.UNIVERSAL`.
+6. No combination with the identical four article IDs may already exist (unless `c.getId()` matches the existing record — i.e. it is an update of the same combination).
+
+<ParamField path="c" type="CombinacionMesa" required>
+  The combination to save or update. For a new record, `id` must be `null`.
+</ParamField>
+
+**Returns:** `void`  
+**Throws:** `IllegalArgumentException` if any mandatory field is missing or a category/shape rule is violated. `IllegalStateException` if a duplicate combination already exists.
+
+---
+
+### `eliminar(Integer id)`
+
+```java
+public void eliminar(Integer id)
+```
+
+Deletes a combination record by primary key.
+
+<ParamField path="id" type="Integer" required>Primary key of the combination to delete.</ParamField>
+
+**Returns:** `void`
+
+---
+
+## FacadeTarjetaAlmacen
+
+**Package:** `mx.desarollo.facade`  
+**Delegate:** `DelegateTarjetaAlmacen`
+
+Inventory card (tarjeta de almacén) operations. Provides movement queries, initial inventory lookups, daily totals, and manual movement registration. Coordinates between `MovimientoAlmacenDAO` and `StockDiarioDAO`.
+
+### `consultarMovimientosPorFecha(Integer idArticulo, LocalDate fecha)`
+
+```java
+public List<MovimientoAlmacen> consultarMovimientosPorFecha(Integer idArticulo, LocalDate fecha)
+```
+
+Returns all warehouse movements for a given article on a specific date, ordered by `fechaHoraRegistro ASC`.
+
+<ParamField path="idArticulo" type="Integer" required>Primary key of the article.</ParamField>
+<ParamField path="fecha" type="LocalDate" required>Date to query.</ParamField>
+
+**Returns:** `List<MovimientoAlmacen>`
+
+---
+
+### `consultarMovimientosPorRango(Integer idArticulo, LocalDate fechaInicio, LocalDate fechaFin)`
+
+```java
+public List<MovimientoAlmacen> consultarMovimientosPorRango(
+    Integer idArticulo,
+    LocalDate fechaInicio,
+    LocalDate fechaFin)
+```
+
+Returns all warehouse movements for an article within a date range, ordered by `fecha ASC, fechaHoraRegistro ASC`.
+
+<ParamField path="idArticulo" type="Integer" required>Primary key of the article.</ParamField>
+<ParamField path="fechaInicio" type="LocalDate" required>Start of the range (inclusive).</ParamField>
+<ParamField path="fechaFin" type="LocalDate" required>End of the range (inclusive).</ParamField>
+
+**Returns:** `List<MovimientoAlmacen>`
+
+---
+
+### `obtenerInventarioInicial(Integer idArticulo, LocalDate fecha)`
+
+```java
+public int obtenerInventarioInicial(Integer idArticulo, LocalDate fecha)
+```
+
+Returns the opening inventory count for an article on a given date. The delegate queries `StockDiarioDAO.obtenerInventarioInicial`, which falls back to the most recent prior `StockDiario` record or the article's current `unidades` if no history exists.
+
+<ParamField path="idArticulo" type="Integer" required>Primary key of the article.</ParamField>
+<ParamField path="fecha" type="LocalDate" required>The date for which opening inventory is requested.</ParamField>
+
+**Returns:** Opening unit count as `int`.
+
+---
+
+### `calcularTotalesDiarios(Integer idArticulo, LocalDate fecha)`
+
+```java
+public int[] calcularTotalesDiarios(Integer idArticulo, LocalDate fecha)
+```
+
+Returns a two-element array `[entradas, salidas]` — the sum of all ENTRADA-type movements and all SALIDA-type movements for the article on the given date.
+
+<ParamField path="idArticulo" type="Integer" required>Primary key of the article.</ParamField>
+<ParamField path="fecha" type="LocalDate" required>Date to aggregate.</ParamField>
+
+**Returns:** `int[]` where index `0` = total entries (inbound), index `1` = total exits (outbound).
+
+---
+
+### `registrarMovimiento(MovimientoAlmacen movimiento)`
+
+```java
+public void registrarMovimiento(MovimientoAlmacen movimiento)
+```
+
+Manually persists a single warehouse movement record. Used for adjustments or corrections entered by an administrator. Automatic movements triggered by rental state changes are registered by `DelegateRenta`, not by this method.
+
+<ParamField path="movimiento" type="MovimientoAlmacen" required>
+  The movement to persist. Must have `articulo`, `fecha`, `tipoMovimiento`, `cantidad`, and `concepto` set before calling this method.
+</ParamField>
+
+**Returns:** `void`

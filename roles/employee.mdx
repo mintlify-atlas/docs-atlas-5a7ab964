@@ -1,0 +1,201 @@
+---
+title: "Employee Role: Delivery and Recolección Management"
+sidebarTitle: "Employee"
+description: "Employees log in to claim rentals, advance them through delivery and recolección states, and leave handoff comments — no access to admin pages."
+---
+
+Employees in SiCom — Eventos Campestre have a focused, task-oriented role: they see the pool of open and already-assigned rentals, claim deliveries or recolecciones, advance each rental through its logistics states, and optionally leave comments at key handoff points. Their access is intentionally narrow — they have no visibility into article management, quotation processing, client data, or analytics. This design keeps the employee interface simple and prevents accidental changes to business-critical data.
+
+## Authentication Flow
+
+The login form at `login.xhtml` is shared between administrators and employees. When `loginUI.login()` receives credentials that resolve to an `Empleado` instance, the session stores the employee object and redirects directly to the employee task list:
+
+```java
+// LoginBeanUI.java
+Object result = loginHelper.login(correo, contrasena);
+
+if (result instanceof mx.desarollo.entity.Administrador) {
+    usuario = result;
+    context.getExternalContext().redirect(
+        context.getExternalContext().getRequestContextPath()
+        + "/principalAdministrador.xhtml");
+} else if (result instanceof mx.desarollo.entity.Empleado) {
+    usuario = result;
+    context.getExternalContext().redirect(
+        context.getExternalContext().getRequestContextPath()
+        + "/RentasEmpleado.xhtml");
+}
+```
+
+`LoginHelper` delegates to `ServiceFacadeLocator → FacadeLogin → DelegateLogin`. Because the returned object is an `Empleado`, the administrator home page is never visited and the session `usuario` field holds only the employee entity.
+
+## `Empleado` Entity
+
+The `Empleado` JPA entity maps to the `empleado` table:
+
+```java
+// mx.desarollo.entity.Empleado
+@Entity
+@Table(name = "empleado")
+public class Empleado {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "idempleado", nullable = false)
+    private Integer id;
+
+    @Size(max = 80) @NotNull
+    @Column(name = "nombre", nullable = false, length = 80)
+    private String nombre;
+
+    @Size(max = 45) @NotNull
+    @Column(name = "apellido_paterno", nullable = false, length = 45)
+    private String apellidoPaterno;
+
+    @Size(max = 45) @NotNull
+    @Column(name = "apellido_materno", nullable = false, length = 45)
+    private String apellidoMaterno;
+
+    @Size(max = 45) @NotNull
+    @Column(name = "correo", nullable = false, length = 45, unique = true)
+    private String correo;
+
+    @Size(max = 255) @NotNull
+    @Column(name = "contrasena", nullable = false, length = 255)
+    private String contrasena;
+
+    @Transient
+    public String getNombreCompleto() {
+        return (nombre != null ? nombre : "") + " "
+             + (apellidoPaterno != null ? apellidoPaterno : "") + " "
+             + (apellidoMaterno != null ? apellidoMaterno : "");
+    }
+}
+```
+
+| Column | Type | Constraint |
+|--------|------|------------|
+| `idempleado` | `INT` AUTO_INCREMENT | Primary key |
+| `nombre` | `VARCHAR(80)` | `NOT NULL` |
+| `apellido_paterno` | `VARCHAR(45)` | `NOT NULL` |
+| `apellido_materno` | `VARCHAR(45)` | `NOT NULL` |
+| `correo` | `VARCHAR(45)` | `NOT NULL`, `UNIQUE` |
+| `contrasena` | `VARCHAR(255)` | `NOT NULL` |
+
+The `@Transient` method `getNombreCompleto()` concatenates `nombre`, `apellidoPaterno`, and `apellidoMaterno` — it is not persisted to the database, but is used extensively in the UI to display the employee's full name on rental cards and in the admin employee list.
+
+## Pages Accessible to Employees
+
+Employees can only reach two views. Both register `#{loginUI.preventBackAfterLogout}` on `preRenderView`.
+
+| Page | Purpose |
+|------|---------|
+| `RentasEmpleado.xhtml` | Task list — all rentals in non-final states that are either unassigned or assigned to this employee |
+| `DetalleRentaEmpleado.xhtml` | Rental detail — full information for a single rental, state-advance controls, and comment entry |
+
+### `RentasEmpleado.xhtml` — Task List
+
+On `preRenderView`, `empleadoRentaUI.cargarRentas()` is called. The `EmpleadoRentaBeanUI` bean injects `LoginBeanUI` and extracts the authenticated employee:
+
+```java
+// EmpleadoRentaBeanUI.java
+@PostConstruct
+public void init() {
+    rentaHelper = new RentaHelper();
+    if (loginBean != null && loginBean.getUsuario() instanceof Empleado) {
+        this.empleadoLogueado = (Empleado) loginBean.getUsuario();
+        cargarRentas();
+    }
+}
+
+public void cargarRentas() {
+    if (this.empleadoLogueado != null) {
+        this.rentasPendientes =
+            rentaHelper.obtenerRentasDisponiblesYAsignadas(
+                this.empleadoLogueado.getId());
+    }
+}
+```
+
+`obtenerRentasDisponiblesYAsignadas(idEmpleado)` returns every rental that is either unassigned (`idEmpleado IS NULL`) or already assigned to this employee, and whose state is not a final state. The resulting list is rendered as a flex grid of cards. Each card shows:
+
+- A **badge** — orange `DISPONIBLE` for unassigned or `Pendiente a recoleccion` rentals; green `ASIGNADA — [NOMBRE]` for rentals already owned by this employee.
+- Client name and delivery address.
+- Delivery date (`fechaInicio`), recolección date (`fecha`), and time (`hora`).
+- Current status in italic.
+
+Clicking any card navigates to `DetalleRentaEmpleado.xhtml?idRenta={id}`.
+
+### `DetalleRentaEmpleado.xhtml` — Rental Detail
+
+`EmpleadoRentaBeanUI.cargarRentaSeleccionada()` loads the full `Renta` entity and computes the next logical state via `rentaHelper.calcularSiguienteEstado(currentEstado)`.
+
+## Rental State Transitions
+
+Employees trigger state advances from the detail view. The method `verificarSiRequiereComentario()` checks whether the target state requires a delivery or recolección comment before committing:
+
+```java
+public void verificarSiRequiereComentario() {
+    this.estadoPendienteDeGuardar = siguienteEstado;
+
+    if ("Entregado".equals(siguienteEstado)
+            || "Finalizada".equals(siguienteEstado)) {
+        // Show comment dialog before advancing
+        PrimeFaces.current().executeScript(
+            "PF('dlgComentarioEstado').show();");
+    } else {
+        avanzarEstado(); // Advance directly without comment
+    }
+}
+```
+
+`avanzarEstado()` applies auto-assignment and name capture logic, then persists the change:
+
+```java
+public boolean avanzarEstado() {
+    // Auto-assign employee when starting delivery or recolección
+    if ("En reparto".equals(siguienteEstado)
+            || "En recoleccion".equals(siguienteEstado)) {
+        rentaSeleccionada.setIdEmpleado(this.empleadoLogueado);
+    }
+    // Record who completed the delivery or recolección
+    if ("Entregado".equals(siguienteEstado)) {
+        rentaSeleccionada.setEntregado(this.empleadoLogueado.getNombre());
+        rentaSeleccionada.setIdEmpleado(null); // Release assignment
+    } else if ("Finalizada".equals(siguienteEstado)) {
+        rentaSeleccionada.setRecogido(this.empleadoLogueado.getNombre());
+        rentaSeleccionada.setIdEmpleado(null); // Release assignment
+    }
+    rentaSeleccionada.setEstado(siguienteEstado);
+    rentaHelper.actualizarRenta(rentaSeleccionada);
+    rentaHelper.cambiarEstado(rentaSeleccionada.getId(), siguienteEstado);
+    cargarRentaSeleccionada();
+    return true;
+}
+```
+
+The typical transitions an employee performs are:
+
+| Trigger | From state | To state | Comment required |
+|---------|-----------|----------|-----------------|
+| Start delivery run | `Aprobada` / `Confirmado` | `En reparto` | No |
+| Mark delivered | `En reparto` | `Entregado` | Yes — "Detalles en la entrega" |
+| Start recolección | `Pendiente a recoleccion` | `En recoleccion` | No |
+| Mark finalised | `En recoleccion` | `Finalizada` | Yes — "Detalles en la recolección" |
+
+When a comment is required, the dialog collects free-text, wraps it in a `Comentario` entity (type `"Entrega"` or `"Recoleccion"`), saves it, and then calls `avanzarEstado()`.
+
+## Creating an Employee Account
+
+Only an administrator can create employee accounts. The workflow is entirely within `AdminEmpleados.xhtml`, backed by `empleadoUI` (`EmpleadoBeanUI`):
+
+1. The administrator clicks **Alta** — `empleadoUI.prepararNuevoEmpleado()` resets the form bean.
+2. The modal collects `apellidoPaterno`, `apellidoMaterno`, `nombre`, `correo`, and `contrasena`.
+3. On submit, `empleadoUI.guardarEmpleado()` validates all fields (including email format `^[^@\s]+@[^@\s]+\.[^@\s]+$`) and calls `facadeEmpleado.saveEmpleado(nuevoEmpleado)`.
+4. If a duplicate email is detected, the database throws a unique-constraint exception; the bean catches it and surfaces the message "El correo electrónico ya se encuentra registrado."
+
+Password resets are also available: the **Restablecer Contraseña** button opens a focused modal where the administrator enters a new password that `empleadoUI.restablecerContrasena()` applies to the selected employee via `facadeEmpleado.updateEmpleado()`.
+
+<Warning>
+  Employees have no access to any administrator pages. If an employee attempts to navigate directly to `principalAdministrador.xhtml`, `Articulos.xhtml`, `AdminEmpleados.xhtml`, `Rentas.xhtml`, `Cotizaciones.xhtml`, `Dashboard.xhtml`, or `TarjetaAlmacen.xhtml`, the `preventBackAfterLogout()` listener will detect that `usuario` is an `Empleado` (not an `Administrador`) with a valid correo, so `notLoggedIn` remains `false` — however, those pages do not render employee-specific navigation and the employee will see the admin layout without the correct data context. To strictly enforce role separation, consider adding a role check that redirects employees to `RentasEmpleado.xhtml` if they land on an admin-only page.
+</Warning>

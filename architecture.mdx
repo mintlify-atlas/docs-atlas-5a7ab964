@@ -1,0 +1,233 @@
+---
+title: "SiCom Multi-Module Maven Architecture Explained"
+sidebarTitle: "Architecture"
+description: "SiCom is split into four Maven modules — entidad, persistencia, negocio, and vista — each owning a distinct layer of the application stack."
+---
+
+SiCom is structured as a four-module Maven project (group ID `mx.avanti.desarollo`, parent artifact `guia`). Each module owns one well-defined layer of the application: JPA entities, data-access objects, business facades, and JSF views. Dependencies flow strictly downward — the view layer depends on the business layer, which depends on persistence, which depends on the entity model. No layer may reference a higher one, keeping concerns cleanly separated and the codebase independently testable.
+
+## Module Overview
+
+| Module | Artifact ID | Root Package | Responsibility |
+|---|---|---|---|
+| Entity model | `entidad` | `mx.desarollo.entity` | JPA `@Entity` classes, enums, and value objects |
+| Persistence | `persistencia` | `mx.avanti.desarollo` | `AbstractDAO`, `HibernateUtil`, concrete DAOs, `ServiceLocator` |
+| Business | `negocio` | `mx.desarollo` | Facade classes, Delegate classes, `ServiceFacadeLocator` |
+| Web / View | `vista` | `ui`, `helper` | CDI `@Named` beans, Helper classes, JSF XHTML pages, servlets |
+
+All four modules compile to Java 21 (`maven.compiler.source=21`). The `vista` module is the only one packaged as a WAR; the others produce JARs that are bundled inside it.
+
+---
+
+## Layer Details
+
+### entidad — JPA Entity Model
+
+Package: `mx.desarollo.entity`
+
+The `entidad` module contains every JPA `@Entity` class and supporting enums. Hibernate 6 maps these classes to the MySQL schema; Hibernate validates the schema on every startup (`hbm2ddl.auto=validate`).
+
+**Entities registered in `persistence.xml`:**
+
+| Entity | Table | Purpose |
+|---|---|---|
+| `Articulo` | `articulo` | Rentable item — name, `Categoria`, price, stock, active flag, `Imagen` FK |
+| `Imagen` | `imagen` | Binary image data and MIME type for an article |
+| `Renta` | `renta` | Quotation or rental record — state, dates, client, employee, total |
+| `Detallerenta` | `detallerenta` | Line item of a rental (article + quantity + subtotal) |
+| `Cliente` | `cliente` | Client contact and authentication data |
+| `Empleado` | `empleado` | Employee contact and authentication data |
+| `Administrador` | `administrador` | Administrator credentials |
+| `CombinacionMesa` | `combinacion_mesa` | Preset table-and-linen pairings for quick cart additions |
+| `Comentario` | `comentario` | Notes attached to a rental by any user |
+| `StockDiario` | `stock_diario` | Absolute stock snapshot per article per calendar day |
+| `StockReservadoDiario` | `stock_reservado_diario` | Reserved units per article per day (drives availability checks) |
+| `MovimientoAlmacen` | `movimiento_almacen` | Audit log of stock entries and exits |
+
+**Supporting enums:**
+
+- `Categoria` — `MESA`, `TEXTIL`, `SILLA`, `CARPA`, `COOLER`, `CALENTON`
+- `Forma` — `REDONDA`, `RECTANGULAR`, `UNIVERSAL`
+- `TextilTipo` — `MANTEL`, `CAMINO`, `CUBREMANTEL`
+- `TipoMovimiento` — warehouse movement direction
+
+---
+
+### persistencia — Data Access Layer
+
+Package: `mx.avanti.desarollo`
+
+The `persistencia` module initializes Hibernate and provides all data-access objects. The central utility class is `HibernateUtil`, which builds a single `EntityManagerFactory` from the persistence unit named **`persistencePU`** (defined in `persistence.xml`) and vends short-lived `EntityManager` instances on demand.
+
+HikariCP connection pooling is configured directly in `persistence.xml`:
+
+| Property | Value |
+|---|---|
+| `hibernate.hikari.minimumIdle` | `5` |
+| `hibernate.hikari.maximumPoolSize` | `10` |
+| `hibernate.hikari.idleTimeout` | `30000` ms |
+
+`AbstractDAO<T>` is the generic base class for every DAO. It wraps every operation in its own `EntityManager` + `EntityTransaction`, commits on success, and rolls back on any `RuntimeException`. Concrete DAOs extend it and add domain-specific JPQL or native queries:
+
+`ArticuloDAO`, `RentaDAO`, `ClienteDAO`, `EmpleadoDAO`, `AdministradorDAO`, `CombinacionMesaDAO`, `DetallerentaDAO`, `StockDiarioDAO`, `StockReservadoDAO`, `MovimientoAlmacenDAO`, `ComentarioDAO`, `DashboardDAO`
+
+`ServiceLocator` is a static factory that instantiates each DAO with a fresh `EntityManager` obtained from `HibernateUtil`. It is the only class in the persistence layer that the business layer calls directly.
+
+---
+
+### negocio — Business / Facade Layer
+
+Package: `mx.desarollo`
+
+The `negocio` module provides two sub-layers per feature domain: a **Facade** and a **Delegate**. This pattern allows business rules (validation, state transitions, aggregation) to live in the Facade while the Delegate owns the wiring to `ServiceLocator`.
+
+**Facade classes:**
+
+| Facade | Responsibility |
+|---|---|
+| `FacadeArticulo` | Catalog CRUD, soft-delete on constraint violation, duplicate-name guard |
+| `FacadeRenta` | Quotation registration, state machine transitions, rental updates with stock recalculation |
+| `FacadeDashboard` | Aggregated metrics, funnel data, top-article ranking, client-growth series |
+| `FacadeEmpleado` | Employee CRUD and lookup |
+| `FacadeCarrito` | Shopping-cart session logic and quote submission |
+| `FacadeCombinacionMesa` | Preset table-linen combination management |
+| `FacadeTarjetaAlmacen` | Warehouse card views and movement registration |
+| `FacadeLogin` | Authentication for both `Administrador` and `Empleado` entities |
+
+**Delegate classes** (one per Facade) wrap `ServiceLocator` calls and translate between business objects and DAO parameters:
+
+`DelegateArticulo`, `DelegateRenta`, `DelegateEmpleado`, `DelegateCarrito`, `DelegateCombinacionMesa`, `DelegateTarjetaAlmacen`, `DelegateDashboard`, `DelegateLogin`
+
+`ServiceFacadeLocator` is a lazy-initializing static registry that vends singleton Facade instances to the view layer, mirroring the role that `ServiceLocator` plays for DAOs.
+
+---
+
+### vista — Web / View Layer
+
+Package: `ui` (CDI beans), `helper` (intermediate helpers), `config` (listeners), `upload` (servlet)
+
+The `vista` module is the only deployable artifact (WAR). It contains:
+
+- **CDI `@Named` managed beans** in the `ui` package — one per screen or feature, annotated `@SessionScoped` or `@RequestScoped`, named for EL expression binding in XHTML pages
+- **Helper classes** in the `helper` package — plain Java objects that translate between UI data transfer objects (DTOs) and Facade calls, keeping beans thin
+- **XHTML views** — PrimeFaces 14 component pages mapped to `*.xhtml` by the Faces Servlet
+- **`UploadImageServlet`** — handles multipart image uploads outside the JSF lifecycle for large binary payloads
+- **`UploadInitListener`** — a `ServletContextListener` that pre-configures the upload directory at application startup
+
+**Key `@Named` beans:**
+
+`LoginBeanUI`, `ArticuloBeanUI`, `ArticuloCatalogoBeanUI`, `CarritoBean`, `RentaBeanUI`, `EmpleadoBeanUI`, `EmpleadoRentaBeanUI`, `DashboardBeanUI`, `DashboardRentasBeanUI`, `DashboardCotizacionesBeanUI`, `DashboardClientesBeanUI`, `CombinacionMesaAdminBeanUI`, `CombinacionMesaClienteBeanUI`, `TarjetaAlmacenBeanUI`, `ContactoBean`
+
+---
+
+## Request Flow
+
+A user action in the browser travels through every layer before reaching MySQL:
+
+```
+XHTML view (PrimeFaces)
+   │  EL binding  #{articuloUI.guardarNuevo()}
+   ▼
+CDI Bean  ui.ArticuloBeanUI  (@Named @SessionScoped)
+   │  delegates to helper
+   ▼
+Helper  helper.ArticuloHelper
+   │  calls ServiceFacadeLocator
+   ▼
+Facade  mx.desarollo.facade.FacadeArticulo
+   │  validates business rules, calls delegate
+   ▼
+Delegate  mx.desarollo.delegate.DelegateArticulo
+   │  calls ServiceLocator
+   ▼
+DAO  mx.avanti.desarollo.dao.ArticuloDAO  (extends AbstractDAO)
+   │  EntityManager + EntityTransaction
+   ▼
+MySQL 8  (via HikariCP pool, persistence unit "persistencePU")
+```
+
+---
+
+## Code Example — Bean → Helper → Facade
+
+The following excerpt shows the real pattern used across the application. `ArticuloBeanUI` stays free of Facade imports; it only knows about `ArticuloHelper`. The helper calls `ServiceFacadeLocator` to reach the Facade, which in turn calls the Delegate and DAO.
+
+```java
+// ui/ArticuloBeanUI.java  (@Named("articuloUI") @SessionScoped)
+public class ArticuloBeanUI implements Serializable {
+
+    private final ArticuloHelper articuloHelper;
+
+    public ArticuloBeanUI() {
+        articuloHelper = new ArticuloHelper();   // plain instantiation, no CDI injection
+    }
+
+    public void guardarNuevo() {
+        // ... validation logic ...
+        nuevoArticulo.setPrecio(nuevoPrecio);
+
+        Imagen imagen = new Imagen();
+        imagen.setDatos(imagenBytes);
+        imagen.setMime(imagenMime);
+
+        // delegate to helper — bean never touches the Facade directly
+        articuloHelper.guardarConImagen(nuevoArticulo, imagen);
+
+        articulosOriginales = articuloHelper.obtenerTodas();
+    }
+}
+
+// helper/ArticuloHelper.java
+public class ArticuloHelper {
+
+    public void guardarConImagen(Articulo articulo, Imagen imagen) {
+        // reaches across to the business layer via the locator
+        ServiceFacadeLocator.getInstanceFacadeArticulo()
+                            .crearArticuloConImagen(articulo, imagen);
+    }
+
+    public List<Articulo> obtenerTodas() {
+        return ServiceFacadeLocator.getInstanceFacadeArticulo()
+                                   .obtenerArticulos();
+    }
+}
+
+// mx.desarollo.facade.FacadeArticulo
+public class FacadeArticulo {
+
+    private final DelegateArticulo delegateArticulo;
+
+    public FacadeArticulo() {
+        this.delegateArticulo = new DelegateArticulo();
+    }
+
+    public void crearArticuloConImagen(Articulo articulo, Imagen imagen) {
+        if (delegateArticulo.existsArticuloByNombre(articulo.getNombre())) {
+            throw new IllegalArgumentException("Ya existe un articulo con ese nombre");
+        }
+        articulo.setNombre(articulo.getNombre().trim());
+        delegateArticulo.saveArticuloWithImage(articulo, imagen);
+    }
+}
+```
+
+<Note>
+The persistence unit is named **`persistencePU`** (declared in `persistencia/src/main/resources/META-INF/persistence.xml`). `HibernateUtil` bootstraps this unit once at class-loading time and shares the `EntityManagerFactory` for the lifetime of the application. Hibernate is configured with `hbm2ddl.auto=validate`, which means it **checks that the database schema matches the entity mappings on every startup** but never modifies the schema automatically. If the schema is missing or out of date, the application will fail to start — run the SQL migration scripts first.
+</Note>
+
+## What's Next
+
+<CardGroup cols={2}>
+  <Card title="Entity Reference" icon="table" href="reference/entities">
+    Full field-by-field reference for every JPA entity and enum.
+  </Card>
+  <Card title="DAO Layer" icon="database" href="reference/dao-layer">
+    AbstractDAO API and custom query methods in each concrete DAO.
+  </Card>
+  <Card title="Facade API" icon="code" href="reference/facade-api">
+    Public methods of every Facade class and their business rules.
+  </Card>
+  <Card title="Rental States" icon="circle-nodes" href="reference/rental-states">
+    Complete state machine diagram and allowed transitions.
+  </Card>
+</CardGroup>

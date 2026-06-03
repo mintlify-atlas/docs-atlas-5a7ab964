@@ -1,0 +1,283 @@
+---
+title: "JPA Entity Reference — SiCom Data Model"
+sidebarTitle: "Entities"
+description: "Field-level reference for every JPA entity in the entidad module: table names, column types, nullability, and ORM relationships managed by Hibernate 6."
+---
+
+The `entidad` module (`mx.desarollo.entity`) contains every Jakarta Persistence entity that makes up the SiCom data model. Hibernate 6 is configured with `hibernate.hbm2ddl.auto=validate`, so it verifies each entity's mapping against the live MySQL 8 schema on every application startup — the schema must already exist before the server boots. The persistence unit `persistencePU` declares all twelve entity classes explicitly and uses a HikariCP connection pool (min 5, max 10 connections) against the `sicom` database.
+
+---
+
+## Articulo
+
+**Table:** `articulo` — represents a single rentable item in the catalog.
+
+| Field | Java Type | Column | Nullable | Notes |
+|---|---|---|---|---|
+| `id` | `Integer` | `idarticulo` | No (PK) | Auto-generated identity |
+| `nombre` | `String` | `nombre` | No | Max 80 chars; catalog display name |
+| `categoria` | `Categoria` | `categoria` | No | Stored as `EnumType.STRING`, max 10 chars |
+| `precio` | `BigDecimal` | `precio` | No | `DECIMAL(10,2)` — unit rental price |
+| `unidades` | `Integer` | `unidades` | No | Total physical units in warehouse |
+| `activo` | `boolean` | `activo` | No | Default `true`; `false` hides item from catalog |
+| `imagen` | `Imagen` | `imagen_id` (FK) | No | `@OneToOne` lazy-fetch; unique FK |
+| `forma` | `Forma` | `forma` | Yes | Max 12 chars; only meaningful for `MESA` or `UNIVERSAL` articles |
+| `textilTipo` | `TextilTipo` | `textil_tipo` | Yes | Max 10 chars; only set when `categoria = TEXTIL` |
+
+**Relationships:**
+
+<ParamField path="imagen" type="Imagen" required>
+  `@OneToOne(fetch = FetchType.LAZY, optional = false)` — every article must have exactly one image. The FK column `imagen_id` carries a unique constraint.
+</ParamField>
+
+---
+
+## Imagen
+
+**Table:** `imagen` — stores article photos as raw binary blobs.
+
+| Field | Java Type | Column | Nullable | Notes |
+|---|---|---|---|---|
+| `id` | `Long` | `id_imagen` | No (PK) | Auto-generated identity |
+| `datos` | `byte[]` | `datos` | No | `LONGBLOB` — raw image bytes |
+| `mime` | `String` | `mime` | No | Max 50 chars; e.g. `image/png`, `image/jpeg` |
+
+`Imagen` has no outbound relationships. It is owned by `Articulo` and `CombinacionMesa` through their respective `@OneToOne` mappings.
+
+---
+
+## Renta
+
+**Table:** `renta` — the central rental/quotation record.
+
+| Field | Java Type | Column | Nullable | Notes |
+|---|---|---|---|---|
+| `id` | `Integer` | `idRenta` | No (PK) | Auto-generated identity |
+| `estado` | `String` | `estado` | No | Max 45 chars; drives the state machine (see [Rental States](/reference/rental-states)) |
+| `idCliente` | `Cliente` | `idCliente` (FK) | No | `@ManyToOne` lazy, `CascadeType.MERGE`; ON DELETE CASCADE |
+| `hora` | `LocalTime` | `hora` | Yes | Requested delivery time |
+| `fechaInicio` | `LocalDate` | `fecha_inicio` | Yes | Start date of the rental period; added via migration |
+| `fecha` | `LocalDate` | `fecha` | Yes | End / event date of the rental period |
+| `idEmpleado` | `Empleado` | `idEmpleado` (FK) | Yes | `@OneToOne` lazy; assigned when entering delivery/collection flow; ON DELETE CASCADE |
+| `entregado` | `String` | `Entregado` | Yes | Max 45 chars; delivery confirmation label |
+| `recogido` | `String` | `Recogido` | Yes | Max 45 chars; collection confirmation label |
+| `total` | `BigDecimal` | `total` | No | `DECIMAL(10,2)` — sum of all line totals |
+| `detallesRenta` | `List<Detallerenta>` | — | — | `@OneToMany(mappedBy="idrenta")`, `CascadeType.ALL`, `orphanRemoval=true`, ordered by `id ASC` |
+
+**Relationships:**
+
+<ParamField path="idCliente" type="Cliente" required>
+  `@ManyToOne(fetch = FetchType.LAZY, cascade = CascadeType.MERGE)` — many rentals can belong to the same client. Hibernate will cascade merge operations to the client record.
+</ParamField>
+
+<ParamField path="idEmpleado" type="Empleado">
+  `@OneToOne(fetch = FetchType.LAZY)` — nullable; set when an employee is assigned to handle delivery or collection.
+</ParamField>
+
+<ParamField path="detallesRenta" type="List<Detallerenta>">
+  `@OneToMany(cascade = ALL, orphanRemoval = true)` — child line items are fully owned by the rental. Removing a `Detallerenta` from the list and merging the parent deletes the row.
+</ParamField>
+
+---
+
+## Detallerenta
+
+**Table:** `detallerenta` — a single line item within a rental.
+
+| Field | Java Type | Column | Nullable | Notes |
+|---|---|---|---|---|
+| `id` | `Integer` | `iddetalle` | No (PK) | Auto-generated identity |
+| `idrenta` | `Renta` | `idrenta` (FK) | No | `@ManyToOne` lazy; ON DELETE CASCADE |
+| `idarticulo` | `Articulo` | `idarticulo` (FK) | No | `@ManyToOne` lazy; the rented article |
+| `cantidad` | `Integer` | `cantidad` | No | Number of units requested |
+| `precioUnitario` | `BigDecimal` | `precio_unitario` | No | `DECIMAL(10,2)` — unit price snapshotted at quotation time |
+| `precioTotal` | `BigDecimal` | `precio_total` | No | `DECIMAL(10,2)` — `cantidad × precioUnitario` |
+
+**Relationships:**
+
+<ParamField path="idrenta" type="Renta" required>
+  `@ManyToOne(fetch = FetchType.LAZY, optional = false)` — back-reference to the parent rental. ON DELETE CASCADE ensures orphan rows are removed by the database if the parent rental is deleted directly via SQL.
+</ParamField>
+
+<ParamField path="idarticulo" type="Articulo" required>
+  `@ManyToOne(fetch = FetchType.LAZY, optional = false)` — reference to the catalog article. Prices are snapshotted at quotation time, so `precioUnitario` does not change even if `Articulo.precio` is later updated.
+</ParamField>
+
+---
+
+## Cliente
+
+**Table:** `cliente` — an end-customer who places rentals.
+
+| Field | Java Type | Column | Nullable | Notes |
+|---|---|---|---|---|
+| `id` | `Integer` | `idCliente` | No (PK) | Auto-generated identity |
+| `nombre` | `String` | `nombre` | No | Max 45 chars |
+| `telefono` | `String` | `telefono` | No | Max 45 chars; stored as plain text |
+| `direccion` | `String` | `direccion` | No | Max 45 chars; delivery address |
+
+`Cliente` carries no direct relationships; it is referenced by `Renta` through `@ManyToOne`.
+
+---
+
+## Empleado
+
+**Table:** `empleado` — a staff member who can be assigned to rentals.
+
+| Field | Java Type | Column | Nullable | Notes |
+|---|---|---|---|---|
+| `id` | `Integer` | `idempleado` | No (PK) | Auto-generated identity |
+| `nombre` | `String` | `nombre` | No | Max 80 chars; given name(s) |
+| `apellidoPaterno` | `String` | `apellido_paterno` | No | Max 45 chars |
+| `apellidoMaterno` | `String` | `apellido_materno` | No | Max 45 chars |
+| `correo` | `String` | `correo` | No | Max 45 chars; unique constraint |
+| `contrasena` | `String` | `contrasena` | No | Max 255 chars; bcrypt hash |
+| `getNombreCompleto()` | `String` | — | — | `@Transient` computed property: `nombre + apellidoPaterno + apellidoMaterno` |
+
+<ParamField path="getNombreCompleto()" type="@Transient String">
+  Convenience getter not persisted to the database. Returns the full name as a single space-joined string. Used by the UI to display employee names in rental assignment dialogs.
+</ParamField>
+
+---
+
+## Administrador
+
+**Table:** `administrador` — a privileged platform administrator (separate credential store from `Empleado`).
+
+| Field | Java Type | Column | Nullable | Notes |
+|---|---|---|---|---|
+| `id` | `Integer` | `idAdmin` | No (PK) | Auto-generated identity |
+| `correo` | `String` | `correo` | No | Max 45 chars; login username |
+| `contrasena` | `String` | `contrasena` | No | Max 100 chars; hashed password |
+
+`Administrador` has no FK relationships; it is a standalone credentials table with no cascade operations.
+
+---
+
+## CombinacionMesa
+
+**Table:** `combinacion_mesa` — a curated preset that bundles one table with one or more textile articles for catalog display.
+
+| Field | Java Type | Column | Nullable | Notes |
+|---|---|---|---|---|
+| `id` | `Integer` | `id` | No (PK) | Auto-generated identity |
+| `mesa` | `Articulo` | `mesa_id` (FK) | No | `@ManyToOne` lazy; must be a `MESA` article |
+| `mantel` | `Articulo` | `mantel_id` (FK) | No | `@ManyToOne` lazy; must be a `TEXTIL/MANTEL` article |
+| `camino` | `Articulo` | `camino_id` (FK) | Yes | `@ManyToOne` lazy; optional `TEXTIL/CAMINO` article |
+| `cubre` | `Articulo` | `cubre_id` (FK) | Yes | `@ManyToOne` lazy; optional `TEXTIL/CUBRE` article |
+| `imagen` | `Imagen` | `imagen_id` (FK) | No | `@OneToOne` lazy; unique FK — composite preview photo |
+| `activo` | `boolean` | `activo` | No | Default `true`; controls catalog visibility |
+
+A unique constraint enforces `(mesa_id, mantel_id, camino_id, cubre_id)` so the same combination cannot appear twice.
+
+---
+
+## MovimientoAlmacen
+
+**Table:** `movimiento_almacen` — an immutable audit log of every warehouse entry or exit.
+
+| Field | Java Type | Column | Nullable | Notes |
+|---|---|---|---|---|
+| `id` | `Integer` | `id` | No (PK) | Auto-generated identity |
+| `articulo` | `Articulo` | `idarticulo` (FK) | No | `@ManyToOne` lazy; the affected article |
+| `renta` | `Renta` | `idrenta` (FK) | Yes | `@ManyToOne` lazy; nullable for non-rental movements |
+| `fecha` | `LocalDate` | `fecha` | No | Calendar date of the movement |
+| `fechaHoraRegistro` | `LocalDateTime` | `fecha_hora_registro` | No | Exact timestamp of registration |
+| `tipoMovimiento` | `TipoMovimiento` | `tipo_movimiento` | No | `EnumType.STRING`, max 10 chars; `ENTRADA` or `SALIDA` |
+| `cantidad` | `Integer` | `cantidad` | No | Number of units moved |
+| `precioUnitario` | `BigDecimal` | `precio_unitario` | No | `DECIMAL(10,2)` — unit price at movement time |
+| `concepto` | `String` | `concepto` | Yes | Max 200 chars; free-text description |
+
+---
+
+## StockDiario
+
+**Table:** `stock_diario` — a daily snapshot of an article's inventory levels.
+
+| Field | Java Type | Column | Nullable | Notes |
+|---|---|---|---|---|
+| `id` | `Integer` | `id` | No (PK) | Auto-generated identity |
+| `articulo` | `Articulo` | `idarticulo` (FK) | No | `@ManyToOne` lazy |
+| `fecha` | `LocalDate` | `fecha` | No | The date this snapshot covers |
+| `inventarioInicial` | `Integer` | `inventario_inicial` | No | Stock count at the start of the day |
+| `existenciaFinal` | `Integer` | `existencia_final` | No | Stock count at the end of the day |
+
+A unique constraint on `(idarticulo, fecha)` ensures at most one snapshot row per article per day.
+
+---
+
+## StockReservadoDiario
+
+**Table:** `stock_reservado_diario` — per-article, per-day reservation totals written by the `cambiar_estado_renta` stored procedure.
+
+| Field | Java Type | Column | Nullable | Notes |
+|---|---|---|---|---|
+| `id` | `Long` | `id_stock_reservado` | No (PK) | Auto-generated identity |
+| `idarticulo` | `Articulo` | `idarticulo` (FK) | No | `@ManyToOne` lazy; ON DELETE CASCADE |
+| `fecha` | `LocalDate` | `fecha` | No | The reserved date |
+| `cantidadReservada` | `Integer` | `cantidad_reservada` | No | `INT UNSIGNED`; accumulated reserved units for this article on this date |
+
+Rows are upserted (inserted or `ON DUPLICATE KEY UPDATE`) by the stored procedure whenever a rental transitions from `Solicitada` to `Aprobada` or `Confirmado`. See [Stock Management](/reference/stock-management) for the full reservation lifecycle.
+
+---
+
+## Comentario
+
+**Table:** `comentarios` — a delivery or collection note attached to a rental.
+
+| Field | Java Type | Column | Nullable | Notes |
+|---|---|---|---|---|
+| `id` | `Integer` | `idComentario` | No (PK) | Auto-generated identity |
+| `tipo` | `String` | `tipo` | No | MySQL `ENUM('Entrega','Recoleccion')` |
+| `comentario` | `String` | `comentario` | Yes | `TEXT` — free-form note body |
+| `idRenta` | `Renta` | `idRenta` (FK) | No | `@ManyToOne` lazy; ON DELETE CASCADE |
+
+<ParamField path="tipo" type="String" required>
+  Constrained at the database level to exactly two values: `Entrega` (written after the delivery state) and `Recoleccion` (written after the collection state). The application UI enforces this via PrimeFaces dialog logic in `RentaBeanUI`.
+</ParamField>
+
+---
+
+## Enums
+
+### Categoria
+
+Stored as `VARCHAR(10)` via `@Enumerated(EnumType.STRING)` on `Articulo.categoria`.
+
+| Value | Description |
+|---|---|
+| `MESA` | Tables (combined with textiles in `CombinacionMesa`) |
+| `TEXTIL` | Tablecloths, runners, and chair covers |
+| `SILLA` | Chairs |
+| `CARPA` | Event canopies / tents |
+| `COOLER` | Beverage coolers |
+| `CALENTON` | Outdoor heaters |
+
+### Forma
+
+Stored as `VARCHAR(12)` via `@Enumerated(EnumType.STRING)` on `Articulo.forma`. Only meaningful for `MESA` articles and combined-preset catalog filtering.
+
+| Value | Description |
+|---|---|
+| `REDONDA` | Round table |
+| `RECTANGULAR` | Rectangular table |
+| `UNIVERSAL` | Shape-agnostic; applicable to any table type |
+
+### TextilTipo
+
+Stored as `VARCHAR(10)` via `@Enumerated(EnumType.STRING)` on `Articulo.textilTipo`. Must be `null` for non-`TEXTIL` articles.
+
+| Value | Description |
+|---|---|
+| `MANTEL` | Full tablecloth |
+| `CAMINO` | Table runner |
+| `CUBRE` | Chair cover |
+
+### TipoMovimiento
+
+Stored as `VARCHAR(10)` via `@Enumerated(EnumType.STRING)` on `MovimientoAlmacen.tipoMovimiento`.
+
+| Value | Description |
+|---|---|
+| `ENTRADA` | Stock arriving — purchase returns or new inventory |
+| `SALIDA` | Stock leaving — rental dispatch or write-off |

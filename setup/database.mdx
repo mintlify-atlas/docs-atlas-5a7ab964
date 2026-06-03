@@ -1,0 +1,158 @@
+---
+title: "MySQL Database Setup and Migration for SiCom"
+sidebarTitle: "Database"
+description: "How to create the sicom MySQL schema, configure the JPA persistence unit with HikariCP, and run the idempotent stock-reservation migration script."
+---
+
+SiCom uses a MySQL 8 database named `sicom` as its sole persistence store. Hibernate 6 manages the object-relational mapping but — because `hbm2ddl.auto` is set to `validate` — all tables must exist **before** the application starts. This page walks through schema creation, persistence configuration, and the one migration script that must be applied to existing installations.
+
+## Step 1 — Create the Schema
+
+Connect to your MySQL 8 server as a user with `CREATE` privileges and execute:
+
+```sql
+CREATE DATABASE sicom
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_unicode_ci;
+```
+
+Using `utf8mb4` is important: article descriptions, client names, and comments may contain non-BMP Unicode characters (emoji, accented letters) that `utf8` (3-byte) would truncate.
+
+After creating the database, create a dedicated application user and grant the minimum necessary permissions:
+
+```sql
+CREATE USER 'sicom_app'@'localhost' IDENTIFIED BY 'your_strong_password';
+GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE ON sicom.* TO 'sicom_app'@'localhost';
+FLUSH PRIVILEGES;
+```
+
+## Step 2 — Configure persistence.xml
+
+The persistence unit is defined in `persistencia/src/main/resources/META-INF/persistence.xml`. Update the JDBC URL, username, and password to match your environment before building the project.
+
+```xml
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<persistence xmlns="https://jakarta.ee/xml/ns/persistence"
+             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+             xsi:schemaLocation="https://jakarta.ee/xml/ns/persistence
+                 https://jakarta.ee/xml/ns/persistence/persistence_3_0.xsd"
+             version="3.0">
+    <persistence-unit name="persistencePU">
+        <provider>org.hibernate.jpa.HibernatePersistenceProvider</provider>
+
+        <!-- Manually declared entity classes -->
+        <class>mx.desarollo.entity.Administrador</class>
+        <class>mx.desarollo.entity.Empleado</class>
+        <class>mx.desarollo.entity.Imagen</class>
+        <class>mx.desarollo.entity.Articulo</class>
+        <class>mx.desarollo.entity.CombinacionMesa</class>
+        <class>mx.desarollo.entity.Renta</class>
+        <class>mx.desarollo.entity.Detallerenta</class>
+        <class>mx.desarollo.entity.Cliente</class>
+        <class>mx.desarollo.entity.Comentario</class>
+        <class>mx.desarollo.entity.StockReservadoDiario</class>
+        <class>mx.desarollo.entity.StockDiario</class>
+        <class>mx.desarollo.entity.MovimientoAlmacen</class>
+
+        <properties>
+            <!-- JDBC connection -->
+            <property name="jakarta.persistence.jdbc.driver"
+                      value="com.mysql.cj.jdbc.Driver"/>
+            <property name="jakarta.persistence.jdbc.url"
+                      value="jdbc:mysql://localhost:3307/sicom?useSSL=false&amp;serverTimezone=UTC&amp;allowPublicKeyRetrieval=true"/>
+            <property name="jakarta.persistence.jdbc.user"   value="sicom_app"/>
+            <property name="jakarta.persistence.jdbc.password" value="your_strong_password"/>
+
+            <!-- Hibernate dialect / DDL -->
+            <property name="hibernate.show_sql"      value="true"/>
+            <property name="hibernate.format_sql"    value="true"/>
+            <property name="hibernate.hbm2ddl.auto"  value="validate"/>
+
+            <!-- HikariCP pool settings -->
+            <property name="hibernate.hikari.minimumIdle"    value="5"/>
+            <property name="hibernate.hikari.maximumPoolSize" value="10"/>
+            <property name="hibernate.hikari.idleTimeout"    value="30000"/>
+        </properties>
+    </persistence-unit>
+</persistence>
+```
+
+The persistence-unit name **`persistencePU`** is hard-coded in the `ServiceLocator` class used by all DAO and Facade beans. Do not rename it without also updating those references.
+
+### Tables Managed by Hibernate
+
+Because `hbm2ddl.auto=validate` is set, Hibernate only checks that the schema matches the entity mappings — it never creates or alters tables automatically. All twelve tables below must already exist when the application context initialises:
+
+| Table | Entity class |
+|-------|-------------|
+| `administrador` | `Administrador` |
+| `empleado` | `Empleado` |
+| `cliente` | `Cliente` |
+| `articulo` | `Articulo` |
+| `imagen` | `Imagen` |
+| `renta` | `Renta` |
+| `detallerenta` | `Detallerenta` |
+| `combinacion_mesa` | `CombinacionMesa` |
+| `comentario` | `Comentario` |
+| `stock_diario` | `StockDiario` |
+| `stock_reservado_diario` | `StockReservadoDiario` |
+| `movimiento_almacen` | `MovimientoAlmacen` |
+
+<Warning>
+  **Development credentials in source control:** The default `persistence.xml` shipped in the repository contains `user=root` and a plaintext password. These are development-only values. Always override both the username and password before any non-local deployment. Consider externalising credentials through environment variables or a Tomcat `context.xml` resource definition rather than editing the file directly.
+</Warning>
+
+## Step 3 — Run the Stock-Reservation Migration
+
+`sql/migration_fecha_inicio.sql` is an **idempotent** migration script that must be applied to any installation that predates the stock-reservation feature. It is safe to run multiple times — every step checks `INFORMATION_SCHEMA` before making a change.
+
+### What the Script Does
+
+The migration is split into two parts:
+
+**Part 1 — Add `fecha_inicio` to the `renta` table**
+
+1. Adds the column `fecha_inicio DATE NULL` after the existing `fecha` column if it does not already exist.
+2. Back-fills `fecha_inicio` from `fecha` for any rows where it is `NULL`.
+3. Alters the column to `NOT NULL` once all rows have a value.
+4. Creates the index `idx_renta_fecha_inicio` on `renta(fecha_inicio)` if it does not exist.
+
+**Part 2 — Replace the `cambiar_estado_renta` stored procedure**
+
+The new version of the procedure understands the full rental date range `[fecha_inicio, fecha]` and handles stock-reservation bookkeeping atomically:
+
+- **Approving / confirming** a rental (`SOLICITADA` → `Aprobada` or `Confirmado`) inserts or increments rows in `stock_reservado_diario` for every article across every day in the rental window.
+- **Cancelling / finalising** a rental decrements those rows and deletes any that reach zero, freeing stock for future bookings.
+
+### Stored Procedure Signature
+
+```sql
+CREATE PROCEDURE cambiar_estado_renta(
+    IN p_idRenta  INT,
+    IN p_nuevoEst VARCHAR(45)
+)
+```
+
+### Running the Migration
+
+Open `sql/migration_fecha_inicio.sql` in MySQL Workbench (or any MySQL client) and execute the entire file against the `sicom` database:
+
+```sql
+-- From the MySQL CLI:
+USE sicom;
+SOURCE /path/to/SiCom/sql/migration_fecha_inicio.sql;
+```
+
+The script calls the migration helper procedure internally:
+
+```sql
+CALL _tmp_migrar_fecha_inicio();
+```
+
+After execution, the helper procedure is automatically dropped. The script ends with two `SELECT` statements against `INFORMATION_SCHEMA` that each return exactly one row when the migration completed successfully.
+
+After applying the migration, restart the application server so Hibernate re-validates the updated schema.
+
+<Tip>
+  Leave `hibernate.show_sql=true` and `hibernate.format_sql=true` enabled during initial setup. Every JPA query will be printed to the Tomcat console log, which makes it straightforward to verify that entity mappings resolve to the correct tables and columns before going further.
+</Tip>

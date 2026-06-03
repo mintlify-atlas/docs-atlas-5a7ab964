@@ -1,0 +1,145 @@
+---
+title: "Client Flow: Browse, Quote, and Track Rentals"
+sidebarTitle: "Client"
+description: "Clients browse the public catalog with date-range stock filters, build a cart, and submit a rental request — no login or account needed."
+---
+
+The client-facing side of SiCom — Eventos Campestre is a fully public storefront. Clients do not create accounts or log in. Instead, they browse the event-furniture catalog, add items to a shopping cart, and fill in their contact information at checkout. Submitting the form creates both a `Cliente` entity and a `Renta` record with state `Solicitada`. From that point on, the Eventos Campestre team contacts the client directly to confirm logistics and pricing.
+
+<Note>
+  Clients are **not** authenticated users. There is no client login screen, no client session, and no client password. The `Cliente` entity is created at the moment the rental request is submitted — not before.
+</Note>
+
+## `Cliente` Entity
+
+The `Cliente` JPA entity maps to the `cliente` table and holds only the contact data needed to fulfill a rental:
+
+```java
+// mx.desarollo.entity.Cliente
+@Entity
+@Table(name = "cliente")
+public class Cliente {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "idCliente", nullable = false)
+    private Integer id;
+
+    @Size(max = 45) @NotNull
+    @Column(name = "nombre", nullable = false, length = 45)
+    private String nombre;
+
+    @Size(max = 45) @NotNull
+    @Column(name = "telefono", nullable = false, length = 45)
+    private String telefono;
+
+    @Size(max = 45) @NotNull
+    @Column(name = "direccion", nullable = false, length = 45)
+    private String direccion;
+}
+```
+
+| Column | Type | Constraint |
+|--------|------|------------|
+| `idCliente` | `INT` AUTO_INCREMENT | Primary key |
+| `nombre` | `VARCHAR(45)` | `NOT NULL` |
+| `telefono` | `VARCHAR(45)` | `NOT NULL` |
+| `direccion` | `VARCHAR(45)` | `NOT NULL` |
+
+## Client-Facing Pages
+
+| Page | Purpose |
+|------|---------|
+| `principal_cliente.xhtml` | Public landing page — hero image, photo carousel, service category cards, and site footer |
+| `renta_cliente.xhtml` | Full catalog and date-range picker — the primary browsing and checkout entry point |
+| `Carrito.xhtml` | Cart review — line items, quantities, per-item and total pricing |
+| `CombinacionMesa.xhtml` | Table-linen combination browser — visual reference for available mesa + mantel + textile pairings |
+
+## Step-by-Step Client Flow
+
+### Step 1 — Visit the Landing Page
+
+The client arrives at `principal_cliente.xhtml`. A `<f:viewAction>` fires `articuloCatalogoUI.validarAcceso()` before the page renders, ensuring catalog state is initialised.
+
+The page presents:
+
+- A **brand strip** with the Eventos Campestre logo.
+- A full-width **hero image** (`hero-jardin.png`).
+- A **photo carousel** ("Nuestro Trabajo") showing past event setups — Montaje Garden, Evento Social, Boda Campestre, and Celebración Especial — navigated with previous/next buttons via plain JavaScript.
+- A **three-column service grid**: Planeación, Logística, and Calidad — each with a call-to-action button linking to `renta_cliente.xhtml` or `acercaDe.xhtml`.
+- A **site footer** with contact phone numbers and location (Mexicali, Baja California).
+
+A cart icon in the top navigation opens a `<p:dialog>` slide-in panel (`carritoModal`) backed by `carritoBean`. The panel shows line items, per-item quantity controls, total price, and a **Ver Carrito Completo** button linking to `Carrito.xhtml`.
+
+### Step 2 — Browse the Catalog with Date Filtering
+
+`renta_cliente.xhtml` is the main browsing interface, backed by `articuloCatalogoUI` (`ArticuloCatalogoBeanUI`). The bean exposes only articles that are **active** and have available stock. Two date fields gate stock availability:
+
+- **`fechaInicio`** — desired delivery date.
+- **`fecha`** — desired recolección (return) date.
+
+The catalog also supports filtering by `nombre` (keyword search) and `categoria` (article type). Stock availability is evaluated against existing confirmed rentals that overlap the selected date range, ensuring clients only see items they can actually receive.
+
+<Tip>
+  Select `fechaInicio` and `fecha` **before** browsing the catalog. When dates are filled in, `ArticuloCatalogoBeanUI` cross-checks each article's total units against the quantity already committed in overlapping confirmed rentals. Without dates, the stock shown may not reflect real availability on your event day.
+</Tip>
+
+Article cards display the product image, name, category, and unit price. Available articles are rendered using a `<ui:repeat>` or `<p:dataList>` bound to `articuloCatalogoUI.articulos`.
+
+### Step 3 — Add Items to the Cart
+
+Clicking an article invokes `carritoBean.agregarArticuloPorId()`, which:
+
+1. Looks up the `Articulo` by ID.
+2. Checks that the requested quantity does not exceed available stock.
+3. Creates a `CarritoItem` (article reference + quantity + computed line price) and adds it to the in-memory `Carrito` object.
+
+If insufficient stock is detected, a PrimeFaces growl message is shown and the item is not added.
+
+```text
+carritoBean.agregarArticuloPorId(articuloId)
+  └─ stockCheck(articulo, fechaInicio, fecha)
+  └─ carrito.addItem(new CarritoItem(articulo, cantidad))
+```
+
+The cart is maintained in the `carritoBean` CDI bean for the duration of the browsing session. The cart icon in the navigation bar updates its item count badge via Ajax after every add or remove action (`update=":formRenta:tb-count-group"`).
+
+### Step 4 — Review the Cart
+
+Navigating to `Carrito.xhtml` shows the full cart contents. The client can:
+
+- **Increment or decrement** the quantity of any line item using `carritoBean.incrementarCantidad(item)` / `carritoBean.decrementarCantidad(item)`.
+- **Remove an item** entirely with `carritoBean.eliminarItem(item)`.
+- See the **running total** formatted as a currency value.
+
+If the cart is empty, a placeholder message is displayed.
+
+### Step 5 — Submit the Rental Request
+
+From `Carrito.xhtml` or `renta_cliente.xhtml`, the client fills in:
+
+| Field | Maps to |
+|-------|---------|
+| Nombre | `Cliente.nombre` |
+| Teléfono | `Cliente.telefono` |
+| Dirección de entrega | `Cliente.direccion` |
+| Fecha de entrega | `Renta.fechaInicio` |
+| Fecha de recolección | `Renta.fecha` |
+| Hora | `Renta.hora` |
+
+On submission, the system:
+
+1. Persists a new `Cliente` record with the provided contact fields.
+2. Creates a `Renta` record linking the `Cliente`, the cart items, and the selected dates, with `estado = "Solicitada"`.
+3. Clears the cart.
+4. Displays a confirmation message to the client.
+
+The rental is now visible in the administrator's `Cotizaciones.xhtml` view, where it appears as a new quotation awaiting review.
+
+### Step 6 — Post-Submission Tracking
+
+After submission, the client receives a confirmation screen with their rental details. There is no client portal for ongoing tracking — the Eventos Campestre team contacts the client by phone (using the `telefono` stored on the `Cliente` entity) to confirm pricing, delivery window, and any adjustments. Once the administrator approves and processes the quotation, the rental moves out of `Solicitada` state and enters the active logistics pipeline managed by employees.
+
+## Table-Linen Combinations
+
+Clients can browse `CombinacionMesa.xhtml` to preview available mesa + mantel + camino/cubre pairings before deciding what to include in their cart. Each combination shows the mesa name, mantel name, optional camino or cubre, and a preview image uploaded by the administrator. This page is view-only for clients — no authentication is required to access it.

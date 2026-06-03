@@ -1,0 +1,196 @@
+---
+title: "Rental State Machine — SiCom Lifecycle Reference"
+sidebarTitle: "Rental States"
+description: "All ten rental states, valid transitions, inventory side-effects, and the cambiar_estado_renta stored procedure that enforces state changes atomically."
+---
+
+Every `Renta` record in SiCom travels through a strictly ordered lifecycle controlled by the `estado` column (`VARCHAR(45)`, non-nullable). State changes are never performed by plain `UPDATE` statements from application code; instead, all transitions are routed through the MySQL stored procedure `cambiar_estado_renta`, which handles stock reservation and release atomically inside a transaction. On the Java side, `FacadeRenta.cambiarEstado(Integer idRenta, String nuevoEstado)` is the single entry point used by both the employee UI (`RentaBeanUI`) and background flows.
+
+---
+
+## States
+
+### Solicitada
+
+**Set by:** Client (via the public quotation/cart flow).  
+**Meaning:** The rental has been submitted but not yet reviewed by an administrator or employee. No inventory is reserved at this point — the `stock_reservado_diario` table is not written until the rental is approved.  
+**Inventory effect:** None.
+
+---
+
+### Aprobada
+
+**Set by:** Administrator or employee, from `Solicitada`.  
+**Meaning:** Staff has reviewed and accepted the rental request. This is the first state that triggers stock reservation.  
+**Inventory effect:** The stored procedure iterates every `Detallerenta` row for the rental and **upserts** one `stock_reservado_diario` row per article per day in the range `[fechaInicio, fecha]`, accumulating `cantidad` units.
+
+---
+
+### Confirmado
+
+**Set by:** Administrator or employee, from `Solicitada` (direct confirmation path, skipping `Aprobada`).  
+**Meaning:** The rental is confirmed and scheduled. Functionally identical to `Aprobada` from an inventory perspective.  
+**Inventory effect:** Same upsert logic as `Aprobada` — stock is reserved for every day in `[fechaInicio, fecha]`.
+
+---
+
+### Pendiente a reparto
+
+**Set by:** Employee, from `Aprobada` or `Confirmado`.  
+**Meaning:** Articles have been staged in the warehouse and are awaiting dispatch.  
+**Inventory effect:** None — reservations are already in place.
+
+---
+
+### En reparto
+
+**Set by:** Employee (requires employee assignment in UI dialog), from `Pendiente a reparto`.  
+**Meaning:** Articles are physically in transit to the event venue. `Renta.idEmpleado` must be set before this transition is accepted by the UI.  
+**Inventory effect:** None.
+
+---
+
+### Entregado
+
+**Set by:** Employee, from `En reparto`. UI prompts for a delivery comment (`Comentario.tipo = 'Entrega'`).  
+**Meaning:** All items have been delivered to the client at the event location. `Renta.entregado` is populated.  
+**Inventory effect:** None — items remain reserved until `Finalizada`.
+
+---
+
+### Pendiente a recoleccion
+
+**Set by:** Employee, from `Entregado`.  
+**Meaning:** The event is over; articles are scheduled for pick-up.  
+**Inventory effect:** None.
+
+---
+
+### En recoleccion
+
+**Set by:** Employee (requires employee assignment), from `Pendiente a recoleccion`.  
+**Meaning:** Staff is on-site collecting the rented articles.  
+**Inventory effect:** None.
+
+---
+
+### Finalizada
+
+**Set by:** Employee, from `En recoleccion`. UI prompts for a collection comment (`Comentario.tipo = 'Recoleccion'`). `Renta.recogido` is populated.  
+**Meaning:** All articles have been returned to the warehouse. The rental is closed.  
+**Inventory effect:** The stored procedure **decrements** `stock_reservado_diario.cantidad_reservada` for each article for every day in `[fechaInicio, fecha]`. Rows whose `cantidad_reservada` drops to `0` or below are deleted. Uses `GREATEST(cantidad_reservada - v_cantidad, 0)` to prevent negative values.
+
+<Warning>
+  Stock is only released when transitioning to `Finalizada` (or `Cancelada`) if the **previous state is not already** `Solicitada`, `Cancelada`, or `Finalizada`. If a rental never left `Solicitada`, no reservation was ever created, so there is nothing to release and the procedure skips the decrement logic entirely.
+</Warning>
+
+---
+
+### Cancelada
+
+**Set by:** Administrator or employee, from any active state.  
+**Meaning:** The rental has been cancelled before completion.  
+**Inventory effect:** Same release logic as `Finalizada` — `stock_reservado_diario` rows are decremented and pruned, but only if the previous state was an active (post-`Solicitada`) state.
+
+---
+
+## ESTADOS_ORDENADOS
+
+`RentaBeanUI` defines a static ordered list that drives the dropdown of allowed next states in the employee UI. The list is traversed from the current state's index forward, so an employee can never move a rental backwards.
+
+```java
+private static final List<String> ESTADOS_ORDENADOS = new ArrayList<>();
+static {
+    ESTADOS_ORDENADOS.add("Aprobada");
+    ESTADOS_ORDENADOS.add("Confirmado");
+    ESTADOS_ORDENADOS.add("Pendiente a reparto");
+    ESTADOS_ORDENADOS.add("En reparto");
+    ESTADOS_ORDENADOS.add("Entregado");
+    ESTADOS_ORDENADOS.add("Pendiente a recoleccion");
+    ESTADOS_ORDENADOS.add("En recoleccion");
+    ESTADOS_ORDENADOS.add("Finalizada");
+    ESTADOS_ORDENADOS.add("Cancelada");
+}
+```
+
+`Solicitada` is intentionally absent from `ESTADOS_ORDENADOS` because it is the initial state set at creation time, never a valid *target* for a manual transition.
+
+---
+
+## State Transition Table
+
+| From state | Valid next states |
+|---|---|
+| `Solicitada` | `Aprobada`, `Confirmado`, `Cancelada` |
+| `Aprobada` | `Confirmado`, `Pendiente a reparto`, `Cancelada` |
+| `Confirmado` | `Pendiente a reparto`, `Cancelada` |
+| `Pendiente a reparto` | `En reparto`, `Cancelada` |
+| `En reparto` | `Entregado`, `Cancelada` |
+| `Entregado` | `Pendiente a recoleccion`, `Cancelada` |
+| `Pendiente a recoleccion` | `En recoleccion`, `Cancelada` |
+| `En recoleccion` | `Finalizada`, `Cancelada` |
+| `Finalizada` | — (terminal) |
+| `Cancelada` | — (terminal) |
+
+---
+
+## The `cambiar_estado_renta` Stored Procedure
+
+All state mutations and their inventory side-effects are executed atomically by this procedure. Call it whenever a rental's state must change.
+
+```sql
+CALL cambiar_estado_renta(p_idRenta INT, p_nuevoEst VARCHAR(45));
+```
+
+**Example — approve rental #42:**
+
+```sql
+CALL cambiar_estado_renta(42, 'Aprobada');
+```
+
+**Example — cancel rental #17:**
+
+```sql
+CALL cambiar_estado_renta(17, 'Cancelada');
+```
+
+### Procedure logic summary
+
+1. Fetches `estado`, `fecha_inicio`, and `fecha` from `renta` for the given `p_idRenta`. If no row is found, a `SQLSTATE '45000'` signal is raised and the transaction is rolled back.
+2. If `fecha_inicio` is `NULL` (legacy rows from before the migration), it falls back to `fecha`.
+3. Updates `renta.estado` to `p_nuevoEst`.
+4. **Stock reservation** — runs when `UPPER(estado_actual) = 'SOLICITADA'` AND `p_nuevoEst IN ('Aprobada', 'Confirmado')`:
+   - Opens a cursor over all `detallerenta` rows for the rental.
+   - For each article/quantity pair, loops through every day from `v_fecha_inicio` to `v_fecha_fin` and executes:
+     ```sql
+     INSERT INTO stock_reservado_diario (idarticulo, fecha, cantidad_reservada)
+     VALUES (v_idarticulo, v_dia_actual, v_cantidad)
+     ON DUPLICATE KEY UPDATE
+         cantidad_reservada = cantidad_reservada + v_cantidad;
+     ```
+5. **Stock release** — runs when `p_nuevoEst IN ('Cancelada', 'Finalizada')` AND `UPPER(estado_actual) NOT IN ('SOLICITADA', 'CANCELADA', 'FINALIZADA')`:
+   - For each article/day pair, decrements and prunes:
+     ```sql
+     UPDATE stock_reservado_diario
+     SET cantidad_reservada = GREATEST(cantidad_reservada - v_cantidad, 0)
+     WHERE idarticulo = v_idarticulo AND fecha = v_dia_actual;
+
+     DELETE FROM stock_reservado_diario
+     WHERE idarticulo = v_idarticulo
+       AND fecha = v_dia_actual
+       AND cantidad_reservada <= 0;
+     ```
+6. The entire procedure is wrapped in `START TRANSACTION` / `COMMIT`. An `EXIT HANDLER FOR SQLEXCEPTION` issues `ROLLBACK` and re-raises the exception with `RESIGNAL`.
+
+---
+
+## Java Entry Point
+
+```java
+// FacadeRenta.java
+public void cambiarEstado(Integer idRenta, String nuevoEstado) {
+    delegateRenta.cambiarEstado(idRenta, nuevoEstado);
+}
+```
+
+`FacadeRenta.cambiarEstado` delegates to `DelegateRenta.cambiarEstado`, which invokes the stored procedure via a JPA `EntityManager` native query or stored-procedure call. This is the **only** approved path for changing a rental's state from application code; direct calls to `EntityManager.merge()` on a `Renta` with a modified `estado` field will bypass all inventory logic.

@@ -1,47 +1,131 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get SiCom Running: Clone, Configure, and Deploy"
+sidebarTitle: "Quickstart"
+description: "Go from zero to a running SiCom instance in under 10 minutes — clone the repo, point it at MySQL, build with Maven, and deploy to Tomcat."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+Getting SiCom up and running on your local machine takes fewer than ten minutes. You will clone the repository, create a MySQL database, update the JPA connection properties, build all four Maven modules with a single command, and drop the resulting WAR into Tomcat. By the end you will have a fully functional rental management system accessible in your browser.
 
 ## Prerequisites
 
-Before you begin, you must have:
+Before you begin, make sure the following tools are installed and available on your `PATH`:
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+- **Java 21** (JDK, not JRE) — required by all four Maven modules
+- **Maven 3.9+** — used to build the multi-module project from the repo root
+- **MySQL 8+** — the relational database backend
+- **Apache Tomcat 10.1+** — the target servlet container; earlier versions do not support the Jakarta EE 10 namespace
 
-## Get started
+## Steps
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Clone the repository">
+    Clone the SiCom source repository to your local machine:
 
     ```bash
-    npm install your-package
+    git clone https://github.com/dinogamer089/SiCom.git
+    cd SiCom
     ```
+
+    The repository root contains the parent `pom.xml` and four subdirectories: `entidad/`, `persistencia/`, `negocio/`, and `vista/`.
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
 
-    ```bash
-    your-cli init
+  <Step title="Create the MySQL database">
+    Log in to your MySQL 8 server and create the `sicom` (or `desarrollo`) database:
+
+    ```sql
+    CREATE DATABASE sicom CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
     ```
+
+    Then run the full DDL migration script to create all tables, indexes, and foreign keys. See [Database Setup](/setup/database) for the complete SQL file and a description of every table.
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Configure persistence.xml">
+    Open `persistencia/src/main/resources/META-INF/persistence.xml` and update the JDBC connection properties to match your environment:
+
+    ```xml
+    <properties>
+        <property name="jakarta.persistence.jdbc.driver"
+                  value="com.mysql.cj.jdbc.Driver"/>
+        <property name="jakarta.persistence.jdbc.url"
+                  value="jdbc:mysql://localhost:3307/desarrollo?useSSL=false&amp;serverTimezone=UTC&amp;allowPublicKeyRetrieval=true"/>
+        <property name="jakarta.persistence.jdbc.user"
+                  value="root"/>
+        <property name="jakarta.persistence.jdbc.password"
+                  value="bnleon19"/>
+
+        <property name="hibernate.show_sql"       value="true"/>
+        <property name="hibernate.format_sql"     value="true"/>
+        <property name="hibernate.hbm2ddl.auto"   value="validate"/>
+
+        <property name="hibernate.hikari.minimumIdle"     value="5"/>
+        <property name="hibernate.hikari.maximumPoolSize" value="10"/>
+        <property name="hibernate.hikari.idleTimeout"     value="30000"/>
+    </properties>
+    ```
+
+    Change `localhost:3307` to your MySQL host and port, and replace `root` / `bnleon19` with your actual credentials. The database name in the URL must match the schema you created in the previous step.
+
+    <Warning>
+      Never commit real database credentials to version control. Use environment-variable substitution or a secrets manager before deploying to a shared or production environment.
+    </Warning>
+  </Step>
+
+  <Step title="Build all modules">
+    From the repository root, run a full clean build. Maven will compile and install the four modules in dependency order — `entidad` first, then `persistencia`, `negocio`, and finally `vista`:
 
     ```bash
-    your-cli start
+    mvn clean install
     ```
+
+    A successful build prints `BUILD SUCCESS` and places the deployable archive at `vista/target/vista.war`. If compilation fails, verify that `JAVA_HOME` points to a Java 21 JDK and that your Maven `settings.xml` can reach Maven Central.
+  </Step>
+
+  <Step title="Deploy to Tomcat">
+    Copy the WAR file to your Tomcat `webapps/` directory, then start (or restart) Tomcat:
+
+    ```bash
+    cp vista/target/vista.war $CATALINA_HOME/webapps/
+    $CATALINA_HOME/bin/startup.sh   # Linux / macOS
+    # or
+    %CATALINA_HOME%\bin\startup.bat  # Windows
+    ```
+
+    Tomcat will automatically unpack and deploy the application. Once startup completes, open your browser and navigate to:
+
+    ```
+    http://localhost:8080/vista/
+    ```
+
+    Tomcat will redirect you to the login page (`AutenticacionUsuario.xhtml`).
+  </Step>
+
+  <Step title="Log in">
+    The welcome file configured in `web.xml` is `AutenticacionUsuario.xhtml`. Enter your administrator email and password to access the admin dashboard, or your employee credentials to reach the employee rental view.
+
+    - **Administrator** → redirected to `principalAdministrador.xhtml`
+    - **Employee** → redirected to `RentasEmpleado.xhtml`
+
+    If this is a fresh install, create an initial administrator record directly in the `administrador` table or use the bootstrap endpoint described in [Administrator Role](/roles/administrator).
   </Step>
 </Steps>
 
 <Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
-
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+  The PrimeFaces theme is set to **`saga`** in `web.xml` via the `primefaces.THEME` context parameter. To switch themes, change this value to any PrimeFaces-bundled theme name (e.g., `lara-light-blue`, `arya-blue`) and redeploy the WAR. Client-side validation and Font Awesome icons are also enabled by default.
 </Tip>
+
+## What's Next
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="architecture">
+    Learn how the four Maven modules are layered and how a request flows from XHTML to MySQL.
+  </Card>
+  <Card title="Article Catalog" icon="boxes-stacked" href="features/catalog">
+    Add categories, upload article images, and manage stock levels.
+  </Card>
+  <Card title="Database Setup" icon="database" href="setup/database">
+    Full DDL script, table descriptions, and migration guidance.
+  </Card>
+  <Card title="Administrator Role" icon="user-shield" href="roles/administrator">
+    Permissions, available views, and initial account creation.
+  </Card>
+</CardGroup>
